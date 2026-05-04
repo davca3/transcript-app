@@ -1,0 +1,21 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.swiftpm/
+
+# XcodeGen output (regenerated from project.yml)
+Skribent.xcodeproj
+
+# macOS
+.DS_Store
+
+# Models (downloaded by setup.sh)
+Models/
+*.mlmodelc
+*.onnx
+
+# User data
+UserData/
