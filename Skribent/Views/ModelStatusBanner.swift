@@ -6,10 +6,9 @@ struct ModelStatusBanner: View {
     var body: some View {
         switch transcriber.state {
         case .idle:
-            banner {
-                ProgressView().controlSize(.small)
-                Text("Připravuji Whisper model…").font(.caption).foregroundStyle(.secondary)
-            }
+            // Hidden during the brief idle window; download/load banners take over within 500ms
+            // if needed, otherwise we go straight to .ready (cache hit) without showing anything.
+            EmptyView()
         case .downloading(let p):
             banner {
                 ProgressView(value: p)

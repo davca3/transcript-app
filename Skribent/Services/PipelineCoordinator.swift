@@ -46,14 +46,14 @@ final class PipelineCoordinator {
 
         do {
             rec.status = .running(stage: .decoding, progress: 0.1)
-            recordings.upsert(rec); progress(rec)
+            recordings.upsert(rec, persistImmediately: true); progress(rec)  // first insert → flush
             let samples = try AudioUtils.loadAndResample(from: sourceURL)
             rec.duration = TimeInterval(samples.count) / AudioUtils.targetSampleRate
             try AudioUtils.writeWav(samples: samples, to: rec.audioURL)
             try await runStages(samples: samples, rec: &rec, progress: progress)
         } catch {
             rec.status = .failed(message: error.localizedDescription)
-            recordings.upsert(rec); progress(rec)
+            recordings.upsert(rec, persistImmediately: true); progress(rec)
         }
     }
 
@@ -65,11 +65,10 @@ final class PipelineCoordinator {
             rec.status = .running(stage: .decoding, progress: 0.05)
             recordings.upsert(rec); progress(rec)
             let samples = try AudioUtils.loadAndResample(from: rec.audioURL)
-            // Audio is already 16k mono WAV — don't rewrite it.
             try await runStages(samples: samples, rec: &rec, progress: progress)
         } catch {
             rec.status = .failed(message: error.localizedDescription)
-            recordings.upsert(rec); progress(rec)
+            recordings.upsert(rec, persistImmediately: true); progress(rec)
         }
     }
 
@@ -80,12 +79,12 @@ final class PipelineCoordinator {
         rec: inout Recording,
         progress: @escaping (Recording) -> Void
     ) async throws {
-        rec.status = .running(stage: .transcribing, progress: 0.25)
+        rec.status = .running(stage: .transcribing, progress: 0.05)
         recordings.upsert(rec); progress(rec)
 
-        // Trim silence ONLY for transcription — speeds Whisper up significantly on long
-        // recordings with pauses. The original samples (and audio.wav on disk) are untouched;
-        // we translate Whisper's timestamps back into the original timeline before stitching.
+        // Trim silence for BOTH transcribe and diarize. Pyannote is the long pole — running
+        // it on trimmed audio cuts wall time roughly proportionally to silence ratio.
+        // Cluster turns come back in trimmed timeline; we translate them back to original.
         let (trimmedSamples, translate) = AudioUtils.trimSilence(samples: samples)
         let originalDur = TimeInterval(samples.count) / AudioUtils.targetSampleRate
         let trimmedDur = TimeInterval(trimmedSamples.count) / AudioUtils.targetSampleRate
@@ -93,12 +92,37 @@ final class PipelineCoordinator {
         print(String(format: "[Pipeline] silence-trim: %.1fs → %.1fs (saved %d%%)",
                      originalDur, trimmedDur, savedPct))
 
-        // Run Whisper (on trimmed) + diarization (on full original) in parallel.
-        // Both can want the ANE; Core ML gracefully falls back to GPU/CPU when contended,
-        // which produces noisy "ANEProgramProcessRequestDirect Failed status=0xf" logs but
-        // still completes the inference. Trade noise for ~30-50% wall-clock speedup.
+        // Estimate parallel wall time. On M1 Pro, observed:
+        //   - Whisper turbo + parallel workers ≈ 25× realtime on trimmed audio
+        //   - FluidAudio pyannote ≈ 4× realtime on trimmed audio (the slower of the two)
+        let transcribeEstimate = trimmedDur / 25.0
+        let diarizeEstimate = trimmedDur / 4.0
+        let parallelEstimate = Swift.max(transcribeEstimate, diarizeEstimate, 1.0)
+        let parallelStart = Date()
+        let recId = rec.id
+        let store = recordings
+
+        // Smooth progress driver: every 250ms updates rec.status with interpolated value.
+        // Stage label flips from .transcribing → .diarizing at the halfway mark just to give
+        // the user a sense of which phase is running (both run in parallel, but diarize tends
+        // to be the long pole, so showing it for the second half is honest enough).
+        let progressTask = Task { @MainActor in
+            while !Task.isCancelled {
+                let elapsed = Date().timeIntervalSince(parallelStart)
+                let phaseFrac = Swift.min(0.99, elapsed / parallelEstimate)
+                let overall = 0.05 + 0.90 * phaseFrac
+                let stage: Recording.ProcessingStatus.Stage = phaseFrac < 0.5 ? .transcribing : .diarizing
+                if let idx = store.recordings.firstIndex(where: { $0.id == recId }) {
+                    var r = store.recordings[idx]
+                    r.status = .running(stage: stage, progress: overall)
+                    store.upsert(r)
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+
         async let transcriptTask: Transcript = transcriber.transcribe(samples: trimmedSamples, languageHint: nil)
-        async let turnsTask: [SpeakerTurn] = diarizer.diarize(samples: samples)
+        async let turnsTask: [SpeakerTurn] = diarizer.diarize(samples: trimmedSamples)
 
         let rawTranscript = try await transcriptTask
         let transcript = Transcript(
@@ -107,10 +131,16 @@ final class PipelineCoordinator {
             },
             detectedLanguage: rawTranscript.detectedLanguage
         )
-
-        rec.status = .running(stage: .diarizing, progress: 0.6)
-        recordings.upsert(rec); progress(rec)
-        let turns = try await turnsTask
+        let rawTurns = try await turnsTask
+        // Translate cluster turns from trimmed timeline back to original timeline. Embeddings
+        // are per-turn (computed from speech audio) so they're unaffected by the trim.
+        let turns = rawTurns.map {
+            SpeakerTurn(start: translate($0.start), end: translate($0.end),
+                        clusterId: $0.clusterId, embedding: $0.embedding)
+        }
+        progressTask.cancel()
+        // Read back rec from the store (the timer may have updated it).
+        if let updated = store.recordings.first(where: { $0.id == recId }) { rec = updated }
 
         rec.status = .running(stage: .identifying, progress: 0.8)
         recordings.upsert(rec); progress(rec)
@@ -124,14 +154,18 @@ final class PipelineCoordinator {
             threshold: 0.70
         )
         let assignments = identifier.assign(clusters: clusterEmbeddings)
-        let stitched = stitch(transcript: transcript, turns: mergedTurns, assignments: assignments)
-        let stored = storedAssignments(from: assignments, clusterEmbeddings: clusterEmbeddings)
+        let (stitched, usedClusterIds) = stitch(transcript: transcript, turns: mergedTurns, assignments: assignments)
+        // Drop "ghost" clusters that no segment ended up referencing (diarizer found a turn the
+        // transcript never overlapped) — otherwise they appear as orphan chips with no text.
+        let liveAssignments = assignments.filter { usedClusterIds.contains($0.key) }
+        let liveEmbeddings = clusterEmbeddings.filter { usedClusterIds.contains($0.clusterId) }
+        let stored = storedAssignments(from: liveAssignments, clusterEmbeddings: liveEmbeddings)
 
         let artifact = RecordingArtifact(transcript: stitched, clusterAssignments: stored)
         recordings.saveArtifact(artifact, for: rec)
 
         rec.status = .done
-        recordings.upsert(rec); progress(rec)
+        recordings.upsert(rec, persistImmediately: true); progress(rec)  // terminal → flush
     }
 
     // MARK: - Cluster embeddings
@@ -254,17 +288,21 @@ final class PipelineCoordinator {
 
     // MARK: - Stitching
 
-    /// Assign each transcript segment to the cluster whose turns overlap it most.
+    /// Assign each transcript segment to the cluster whose turns overlap it most. Returns the
+    /// stitched transcript plus the set of cluster ids that ended up referenced by ≥1 segment
+    /// (so the caller can drop ghost clusters from stored assignments).
     private func stitch(
         transcript: Transcript,
         turns: [SpeakerTurn],
         assignments: [Int: SpeakerAssignment]
-    ) -> Transcript {
+    ) -> (transcript: Transcript, usedClusterIds: Set<Int>) {
         var out = transcript
+        var used = Set<Int>()
         for i in out.segments.indices {
             let seg = out.segments[i]
             let cid = dominantCluster(start: seg.start, end: seg.end, turns: turns)
             if let cid, let assignment = assignments[cid] {
+                used.insert(cid)
                 switch assignment {
                 case .known(let speakerId, _, _):
                     out.segments[i].speakerId = speakerId
@@ -273,7 +311,7 @@ final class PipelineCoordinator {
                 }
             }
         }
-        return out
+        return (out, used)
     }
 
     private func dominantCluster(start: TimeInterval, end: TimeInterval, turns: [SpeakerTurn]) -> Int? {

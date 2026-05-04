@@ -71,6 +71,13 @@ final class AudioPlayerController: ObservableObject {
     func seek(to t: TimeInterval) {
         guard let p = player else { return }
         let clamped = max(0, min(t, p.duration))
+        // Skip the publish if the value didn't meaningfully change — avoids spurious
+        // "Publishing changes from within view updates" warnings when SwiftUI's Slider
+        // probes the setter with the same value it already had.
+        guard abs(progress.currentTime - clamped) > 0.001 else {
+            p.currentTime = clamped
+            return
+        }
         p.currentTime = clamped
         progress.currentTime = clamped
     }

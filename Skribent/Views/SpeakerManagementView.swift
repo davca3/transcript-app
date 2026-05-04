@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SpeakerManagementView: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var speakers: SpeakerStore
     @Environment(\.dismiss) private var dismiss
 
     @State private var renamingId: UUID?
@@ -13,7 +14,7 @@ struct SpeakerManagementView: View {
             HStack {
                 Text("Známí mluvčí").font(.title2).bold()
                 Spacer()
-                if !state.speakers.speakers.isEmpty {
+                if !speakers.speakers.isEmpty {
                     Button("Smazat všechny", role: .destructive) { confirmResetAll = true }
                 }
                 Button("Hotovo") { dismiss() }.keyboardShortcut(.defaultAction)
@@ -22,7 +23,7 @@ struct SpeakerManagementView: View {
 
             Divider()
 
-            if state.speakers.speakers.isEmpty {
+            if speakers.speakers.isEmpty {
                 VStack(spacing: 12) {
                     Image(systemName: "person.2.slash").font(.system(size: 40, weight: .light))
                         .foregroundStyle(.secondary)
@@ -33,7 +34,7 @@ struct SpeakerManagementView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 List {
-                    ForEach(state.speakers.speakers) { s in
+                    ForEach(speakers.speakers) { s in
                         HStack {
                             Image(systemName: "person.crop.circle.fill").foregroundStyle(.tint)
                             VStack(alignment: .leading, spacing: 2) {
@@ -47,7 +48,7 @@ struct SpeakerManagementView: View {
                             } label: { Image(systemName: "pencil") }
                             .buttonStyle(.borderless)
                             Button(role: .destructive) {
-                                state.speakers.delete(s.id)
+                                speakers.delete(s.id)
                             } label: { Image(systemName: "trash") }
                             .buttonStyle(.borderless)
                         }
@@ -59,7 +60,7 @@ struct SpeakerManagementView: View {
         .frame(width: 480, height: 480)
         .alert("Smazat všechny mluvčí?", isPresented: $confirmResetAll) {
             Button("Smazat", role: .destructive) {
-                for s in state.speakers.speakers { state.speakers.delete(s.id) }
+                for s in speakers.speakers { speakers.delete(s.id) }
             }
             Button("Zrušit", role: .cancel) {}
         } message: {

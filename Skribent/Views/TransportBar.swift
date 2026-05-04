@@ -5,6 +5,11 @@ struct TransportBar: View {
     @ObservedObject var progress: ProgressTicker
     @Binding var autoFollow: Bool
 
+    /// Local drag state. While the user is dragging, the Slider binds to this value (so it
+    /// doesn't mutate `player.progress.currentTime` per drag delta during a render). On
+    /// release (`onEditingChanged: false`) we commit via `player.seek`.
+    @State private var dragValue: Double?
+
     var body: some View {
         HStack(spacing: 12) {
             Button {
@@ -16,17 +21,23 @@ struct TransportBar: View {
             .buttonStyle(.plain)
             .keyboardShortcut(.space, modifiers: [])
 
-            Text(formatTime(progress.currentTime))
+            Text(formatTime(dragValue ?? progress.currentTime))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 48, alignment: .trailing)
 
             Slider(
                 value: Binding(
-                    get: { progress.currentTime },
-                    set: { player.seek(to: $0) }
+                    get: { dragValue ?? progress.currentTime },
+                    set: { dragValue = $0 }   // pure @State write — no publish
                 ),
-                in: 0...max(player.duration, 0.001)
+                in: 0...max(player.duration, 0.001),
+                onEditingChanged: { editing in
+                    if !editing, let target = dragValue {
+                        player.seek(to: target)
+                        dragValue = nil
+                    }
+                }
             )
 
             Text(formatTime(player.duration))

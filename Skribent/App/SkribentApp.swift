@@ -8,6 +8,8 @@ struct SkribentApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(state)
+                .environmentObject(state.recordings)
+                .environmentObject(state.speakers)
                 .frame(minWidth: 980, minHeight: 600)
         }
         .windowStyle(.titleBar)

@@ -25,21 +25,26 @@ final class SpeakerIdentifier {
         var nextUnnamed = 1
         var usedSpeakerIds: Set<UUID> = []
 
-        print("[SpeakerID] threshold=\(matchThreshold), clusters=\(clusters.count), known=\(store.speakers.count)")
+        // Precompute centroids ONCE (otherwise computed property would re-sum the embeddings
+        // for every (cluster × speaker) pair in the inner loop).
+        struct SpeakerSnapshot { let id: UUID; let name: String; let centroid: [Float] }
+        let snapshots: [SpeakerSnapshot] = store.speakers.map {
+            SpeakerSnapshot(id: $0.id, name: $0.name, centroid: $0.centroid)
+        }
+        print("[SpeakerID] threshold=\(matchThreshold), clusters=\(clusters.count), known=\(snapshots.count)")
 
+        // Per-cluster best-score (incl. below threshold), for tuning visibility.
+        var bestPerCluster: [Int: (name: String, score: Float)] = [:]
         var pool = clusters
         while !pool.isEmpty {
             var best: (poolIdx: Int, speakerId: UUID, name: String, score: Float)?
             for (i, c) in pool.enumerated() {
-                for s in store.speakers where !usedSpeakerIds.contains(s.id) {
-                    // Skip stale profiles whose embedding dim doesn't match the current diarizer.
-                    let centroid = s.centroid
-                    guard centroid.count == c.embedding.count else {
-                        print("[SpeakerID]   SKIP \"\(s.name)\" — dim mismatch (\(centroid.count) vs \(c.embedding.count)). Reset DB in Mluvčí.")
-                        continue
+                for s in snapshots where !usedSpeakerIds.contains(s.id) {
+                    guard s.centroid.count == c.embedding.count else { continue }
+                    let score = Cosine.similarity(c.embedding, s.centroid)
+                    if let cur = bestPerCluster[c.clusterId], score <= cur.score {} else {
+                        bestPerCluster[c.clusterId] = (s.name, score)
                     }
-                    let score = Cosine.similarity(c.embedding, centroid)
-                    print(String(format: "[SpeakerID]   cluster %d vs \"%@\" → %.3f", c.clusterId, s.name, score))
                     if score >= matchThreshold, score > (best?.score ?? -1) {
                         best = (i, s.id, s.name, score)
                     }
@@ -51,11 +56,17 @@ final class SpeakerIdentifier {
                 assignments[cluster.clusterId] = .known(speakerId: b.speakerId, name: b.name, score: b.score)
                 usedSpeakerIds.insert(b.speakerId)
             } else {
+                // Log best per remaining cluster so the user sees how close they were.
+                for c in pool {
+                    if let bp = bestPerCluster[c.clusterId] {
+                        print(String(format: "[SpeakerID] · cluster %d best: \"%@\" %.3f (below %.2f)",
+                                     c.clusterId, bp.name, bp.score, matchThreshold))
+                    }
+                }
                 break
             }
         }
         for c in pool {
-            print("[SpeakerID] · cluster \(c.clusterId) → unnamed Speaker \(nextUnnamed)")
             assignments[c.clusterId] = .unnamed(displayIndex: nextUnnamed, embedding: c.embedding)
             nextUnnamed += 1
         }

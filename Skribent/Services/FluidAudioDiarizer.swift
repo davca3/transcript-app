@@ -21,14 +21,23 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
     init() {}
 
     /// Preload diarization models in the background. Call from app launch.
+    /// Banner only reveals if download takes >500ms — cache hits stay invisible.
     func preload() async {
         guard manager == nil else { return }
         print("[FluidAudio] preload start")
         let t0 = Date()
-        state = .downloading
+        state = .idle
+
+        let revealBannerTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled, let self, case .idle = self.state else { return }
+            self.state = .downloading
+        }
+
         do {
             let models = try await DiarizerModels.downloadIfNeeded()
             print("[FluidAudio] models downloaded/cached in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+            revealBannerTask.cancel()
             state = .loadingIntoMemory
             let m = DiarizerManager(config: .default)
             m.initialize(models: models)
@@ -36,6 +45,7 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
             self.state = .ready
             print("[FluidAudio] ready in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
         } catch {
+            revealBannerTask.cancel()
             self.state = .failed(error.localizedDescription)
             print("[FluidAudio] preload FAILED: \(error)")
         }

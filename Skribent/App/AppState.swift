@@ -45,14 +45,10 @@ final class AppState: ObservableObject {
             speakers: speakers
         )
 
-        // Forward inner stores' changes to AppState's publisher so views observing AppState
-        // refresh when recordings/speakers change (e.g., during regenerate).
-        recordings.objectWillChange
-            .sink { [weak self] in self?.objectWillChange.send() }
-            .store(in: &cancellables)
-        speakers.objectWillChange
-            .sink { [weak self] in self?.objectWillChange.send() }
-            .store(in: &cancellables)
+        // NB: We intentionally do NOT forward recordings/speakers objectWillChange to AppState.
+        // That would re-render every view that observes AppState whenever any store mutates,
+        // including during pipeline stage updates (5×/recording). Views that need a store
+        // declare it as their own @EnvironmentObject (see SkribentApp).
 
         // Warm up models in parallel so first recording is instant.
         Task { await transcriber.preload() }

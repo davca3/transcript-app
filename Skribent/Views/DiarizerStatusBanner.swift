@@ -7,7 +7,7 @@ struct DiarizerStatusBanner: View {
     var body: some View {
         switch diarizer.state {
         case .idle:
-            banner("Připravuji model pro rozpoznávání mluvčích…")
+            EmptyView()
         case .downloading:
             banner("Stahuji diarizační model… (první spuštění)")
         case .loadingIntoMemory:

@@ -22,47 +22,71 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
         self.modelName = modelName
     }
 
+    /// Inspect the WhisperKit / HF-Hub cache directly. If the model is already on disk we skip
+    /// `WhisperKit.download(...)` entirely — that call takes 5+ seconds even for cache hits
+    /// (validation + remote file listing), which is what makes the banner blink on every launch.
+    private func cachedModelFolder() -> URL? {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let folder = docs
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("argmaxinc", isDirectory: true)
+            .appendingPathComponent("whisperkit-coreml", isDirectory: true)
+            .appendingPathComponent(modelName, isDirectory: true)
+        let marker = folder.appendingPathComponent("config.json")
+        return FileManager.default.fileExists(atPath: marker.path) ? folder : nil
+    }
+
     /// Preload model in the background. Call from app launch so first transcription is instant.
-    /// Two-phase: (1) download (with % progress), (2) load into memory + prewarm.
     func preload() async {
         guard pipe == nil else { return }
         print("[WhisperKit] preload start: model=\(modelName)")
         let t0 = Date()
-        state = .downloading(progress: 0)
+        state = .idle
 
-        do {
-            // Phase 1: download via static method so we get progress.
-            // Cached on subsequent runs → returns ~instantly.
-            let lastLogged = LoggedProgress()
-            let folderURL = try await WhisperKit.download(
-                variant: modelName,
-                from: "argmaxinc/whisperkit-coreml",
-                progressCallback: { progress in
-                    let frac = progress.fractionCompleted
-                    let completed = progress.completedUnitCount
-                    let total = progress.totalUnitCount
-                    if lastLogged.shouldLog(frac: frac) {
-                        print(String(format: "[WhisperKit] download progress %.1f%% (%lld / %lld)",
-                                     frac * 100, completed, total))
-                    }
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        // Drop late-firing callbacks once we've moved past the download phase.
-                        // Without this guard, a backlog of queued Tasks publishes state changes
-                        // during the SwiftUI re-render that's removing the banner.
-                        if case .downloading = self.state {
+        let folderURL: URL
+        if let cached = cachedModelFolder() {
+            print("[WhisperKit] cache hit → \(cached.path) (skipping download)")
+            folderURL = cached
+        } else {
+            // Real download path: reveal banner after 500ms (so very fast networks still skip it).
+            let revealBannerTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard !Task.isCancelled, let self, case .idle = self.state else { return }
+                self.state = .downloading(progress: 0)
+            }
+            do {
+                let lastLogged = LoggedProgress()
+                folderURL = try await WhisperKit.download(
+                    variant: modelName,
+                    from: "argmaxinc/whisperkit-coreml",
+                    progressCallback: { progress in
+                        let frac = progress.fractionCompleted
+                        if lastLogged.shouldLog(frac: frac) {
+                            print(String(format: "[WhisperKit] download progress %.1f%% (%lld / %lld)",
+                                         frac * 100, progress.completedUnitCount, progress.totalUnitCount))
+                        }
+                        Task { @MainActor [weak self] in
+                            guard let self, case .downloading = self.state else { return }
                             self.state = .downloading(progress: frac)
                         }
                     }
-                }
-            )
-            print("[WhisperKit] download done in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s → \(folderURL.path)")
+                )
+                revealBannerTask.cancel()
+                print("[WhisperKit] download done in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s → \(folderURL.path)")
+            } catch {
+                revealBannerTask.cancel()
+                self.state = .failed(error.localizedDescription)
+                print("[WhisperKit] preload FAILED (download): \(error)")
+                return
+            }
+        }
 
-            // Phase 2: load WITHOUT prewarm (prewarm hangs on sandboxed macOS for large models).
-            // First transcribe will be a few seconds slower but the app won't sit forever.
-            state = .loadingIntoMemory
-            let t1 = Date()
-            print("[WhisperKit] loading model into memory (prewarm disabled)…")
+        // Load (no prewarm — hangs on sandboxed macOS for large models).
+        state = .loadingIntoMemory
+        let t1 = Date()
+        print("[WhisperKit] loading model into memory (prewarm disabled)…")
+        do {
             let config = WhisperKitConfig(
                 model: modelName,
                 modelFolder: folderURL.path,
@@ -77,7 +101,7 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
             print("[WhisperKit] load done in \(String(format: "%.1f", Date().timeIntervalSince(t1)))s (total \(String(format: "%.1f", Date().timeIntervalSince(t0)))s)")
         } catch {
             self.state = .failed(error.localizedDescription)
-            print("[WhisperKit] preload FAILED: \(error)")
+            print("[WhisperKit] preload FAILED (load): \(error)")
         }
     }
 
@@ -96,6 +120,7 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
             task: .transcribe,
             language: languageHint,
             temperature: 0.0,
+            temperatureFallbackCount: 2,   // default ~5; cuts retry overhead on hard chunks
             sampleLength: 224,
             usePrefillPrompt: true,
             detectLanguage: languageHint == nil,

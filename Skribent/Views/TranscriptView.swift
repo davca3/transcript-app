@@ -35,7 +35,6 @@ struct TranscriptView: View {
         }
         .scrollPosition(id: $scrollPosition, anchor: .top)
         .onAppear { recomputeGroups() }
-        .onChange(of: artifact) { _, _ in recomputeGroups() }
         .onChange(of: speakerStore.speakers) { _, _ in recomputeGroups() }
         .onChange(of: progress.currentTime) { _, now in
             guard autoFollow,
@@ -47,11 +46,19 @@ struct TranscriptView: View {
             lastAutoFollowTarget = id
         }
         .onChange(of: scrollPosition) { _, newPos in
-            // If the new scroll position differs from what auto-follow last set,
-            // it must have been the user — turn auto-follow off.
-            if let newPos, newPos != lastAutoFollowTarget {
-                if autoFollow { autoFollow = false }
+            // Hard-defer the autoFollow flip via DispatchQueue (see RecordingDetailView for
+            // rationale). The Binding writes through to AppStorage which publishes synchronously.
+            guard let newPos, newPos != lastAutoFollowTarget else { return }
+            if autoFollow {
+                DispatchQueue.main.async { autoFollow = false }
             }
+        }
+        .onChange(of: artifact) { _, _ in
+            // Switching recordings (or the artifact body changed): rebuild groups and reset
+            // scroll tracking so we don't carry the previous transcript's targets across.
+            recomputeGroups()
+            lastAutoFollowTarget = nil
+            scrollPosition = nil
         }
     }
 
@@ -191,7 +198,10 @@ private struct TranscriptGroupRow: View {
 }
 
 private struct SegmentGroup: Identifiable, Equatable {
-    let id = UUID()
+    /// Stable identity derived from the first segment's id. Critical: must NOT use a fresh
+    /// UUID() per init — that would invalidate SwiftUI view identity on every recompute and
+    /// destroy scroll position, hover state, and autoFollow state-tracking.
+    var id: UUID { segments.first?.id ?? Self.fallbackId }
     let speakerName: String
     let color: Color
     var segments: [TranscriptSegment]
@@ -199,4 +209,6 @@ private struct SegmentGroup: Identifiable, Equatable {
     var start: TimeInterval { segments.first?.start ?? 0 }
     var end: TimeInterval { segments.last?.end ?? 0 }
     var text: String { segments.map(\.text).joined(separator: " ") }
+
+    private static let fallbackId = UUID()
 }

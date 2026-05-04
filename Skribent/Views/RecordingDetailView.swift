@@ -3,6 +3,8 @@ import UniformTypeIdentifiers
 
 struct RecordingDetailView: View {
     @EnvironmentObject var state: AppState
+    @EnvironmentObject var recordings: RecordingStore
+    @EnvironmentObject var speakers: SpeakerStore
     let recording: Recording
 
     @State private var artifact: RecordingArtifact?
@@ -13,7 +15,11 @@ struct RecordingDetailView: View {
     @State private var exportType: UTType = .plainText
     @State private var reidentifyToast: String?
     @State private var confirmRegenerate = false
-    @AppStorage("transcript.autoFollow") private var autoFollow: Bool = true
+    // Plain @State (not @AppStorage). AppStorage writes to NSUserDefaults synchronously and
+    // posts a system notification that SwiftUI propagates as another view update — chained
+    // with player.load() that fires inside the resulting transaction it produced
+    // "Publishing changes from within view updates" warnings on every recording switch.
+    @State private var autoFollow: Bool = true
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,16 +33,23 @@ struct RecordingDetailView: View {
             Divider()
             transcriptSection
         }
-        .onAppear {
+        .task {
+            // View is keyed by `.id(recording.id)` in SelectedRecordingDetail, so a recording
+            // switch destroys this view and creates a new one — `.task` (no id) runs exactly
+            // once per recording. We still bounce off the runloop before any state writes:
+            // SwiftUI may begin the task body inside the same MainActor work item that
+            // committed the appearance, and synchronous publishes there trigger
+            // "Publishing changes from within view updates."
+            await runLoopBounce()
             reload()
-            player.load(recording.audioURL)
-        }
-        .onChange(of: recording.id) {
-            reload()
+            autoFollow = true
             player.pause()
             player.load(recording.audioURL)
         }
-        .onChange(of: recording.status) { reload() }
+        .onChange(of: recording.status) {
+            if case .done = recording.status { reload() }
+            if case .failed = recording.status { reload() }
+        }
         .fileExporter(
             isPresented: Binding(get: { exporterDoc != nil }, set: { if !$0 { exporterDoc = nil } }),
             document: exporterDoc,
@@ -109,7 +122,7 @@ struct RecordingDetailView: View {
                 ForEach(chips, id: \.displayName) { chip in
                     SpeakerChip(
                         assignment: chip.representative,
-                        knownSpeakers: state.speakers.speakers,
+                        knownSpeakers: speakers.speakers,
                         onRename: {
                             renamingClusterId = chip.clusterIds.first
                             renameDraft = chip.displayName
@@ -125,7 +138,8 @@ struct RecordingDetailView: View {
                                 state.unassignCluster(in: recording, clusterId: cid)
                             }
                             reload()
-                        }
+                        },
+                        onJumpToNext: { jumpToNext(chip: chip) }
                     )
                 }
                 Button {
@@ -170,7 +184,7 @@ struct RecordingDetailView: View {
             TranscriptView(
                 artifact: artifact,
                 progress: player.progress,
-                speakerStore: state.speakers,
+                speakerStore: speakers,
                 autoFollow: $autoFollow,
                 onPlayRange: { start, end in
                     player.play(from: start, until: end)
@@ -194,22 +208,47 @@ struct RecordingDetailView: View {
     // MARK: - Actions
 
     private func reload() {
-        artifact = state.recordings.loadArtifact(for: recording)
+        artifact = recordings.loadArtifact(for: recording)
     }
 
     /// Collapse clusters with the same display name into a single chip and renumber unnamed
-    /// clusters sequentially. Same speaker can be split across multiple clusters by the
-    /// diarizer; this presents them as one chip whose actions apply to all underlying clusters.
+    /// clusters sequentially. Drops "ghost" clusters that no transcript segment references
+    /// (artifacts produced by older pipeline runs before that filter was added).
     private func displayChips(for artifact: RecordingArtifact) -> [DisplayChip] {
-        let names = artifact.displayNames(knownSpeakers: state.speakers.speakers)
+        // Build speakerId → clusterIds map so we can mark which clusters are referenced.
+        var clustersForSpeakerId: [UUID: [Int]] = [:]
+        for (key, a) in artifact.clusterAssignments {
+            guard let cid = Int(key) else { continue }
+            let sid = a.speakerId ?? UnnamedSpeakerID.make(clusterId: cid)
+            clustersForSpeakerId[sid, default: []].append(cid)
+        }
+        var referenced = Set<Int>()
+        for seg in artifact.transcript.segments {
+            guard let sid = seg.speakerId, let cids = clustersForSpeakerId[sid] else { continue }
+            for cid in cids { referenced.insert(cid) }
+        }
+
+        // Walk filtered, sorted clusters; renumber unnamed sequentially over THIS subset.
         let pairs = artifact.clusterAssignments
-            .compactMap { (k, v) -> (Int, StoredAssignment)? in Int(k).map { ($0, v) } }
+            .compactMap { (k, v) -> (Int, StoredAssignment)? in
+                guard let cid = Int(k), referenced.contains(cid) else { return nil }
+                return (cid, v)
+            }
             .sorted { $0.0 < $1.0 }
 
         var entries: [DisplayChip] = []
         var indexByName: [String: Int] = [:]
+        var unnamedCounter = 1
         for (cid, a) in pairs {
-            let name = names[cid] ?? a.displayName
+            let name: String
+            if let sid = a.speakerId, let live = speakers.speakers.first(where: { $0.id == sid }) {
+                name = live.name
+            } else if a.speakerId == nil {
+                name = "Speaker \(unnamedCounter)"
+                unnamedCounter += 1
+            } else {
+                name = a.displayName
+            }
             if let idx = indexByName[name] {
                 entries[idx].clusterIds.append(cid)
             } else {
@@ -227,8 +266,38 @@ struct RecordingDetailView: View {
         return false
     }
 
+    /// Find the next segment belonging to any of the chip's underlying clusters, after the
+    /// current playback time. Wraps around to the chip's first segment if there's nothing later.
+    private func jumpToNext(chip: DisplayChip) {
+        guard let artifact else { return }
+
+        // Resolve all UUIDs that segments could carry for this chip's clusters.
+        var targetIds = Set<UUID>()
+        for cid in chip.clusterIds {
+            if let stored = artifact.assignment(for: cid), let sid = stored.speakerId {
+                targetIds.insert(sid)
+            } else {
+                targetIds.insert(UnnamedSpeakerID.make(clusterId: cid))
+            }
+        }
+
+        let now = player.progress.currentTime
+        let segments = artifact.transcript.segments
+        let next = segments.first(where: {
+            guard let sid = $0.speakerId else { return false }
+            return targetIds.contains(sid) && $0.start > now + 0.05  // small epsilon to skip current
+        })
+        let target = next ?? segments.first(where: {
+            guard let sid = $0.speakerId else { return false }
+            return targetIds.contains(sid)
+        })
+        if let target {
+            player.play(from: target.start)
+        }
+    }
+
     private func applyRename(clusterId: Int, name: String) {
-        guard let artifact = state.recordings.loadArtifact(for: recording),
+        guard let artifact = recordings.loadArtifact(for: recording),
               let stored = artifact.assignment(for: clusterId) else { return }
         if let speakerId = stored.speakerId {
             state.renameKnown(speakerId: speakerId, to: name)
@@ -287,6 +356,16 @@ private struct DisplayChip {
     var displayName: String
     var representative: StoredAssignment
     var clusterIds: [Int]
+}
+
+/// Suspends the current MainActor task until the next runloop pass — strictly stronger
+/// than `Task.yield()`, which can resume inside the same MainActor work item that scheduled
+/// the task. Used to defer state writes past an in-flight SwiftUI view update transaction.
+@MainActor
+private func runLoopBounce() async {
+    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        DispatchQueue.main.async { cont.resume() }
+    }
 }
 
 // MARK: - FileDocument adapter

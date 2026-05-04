@@ -5,6 +5,9 @@ enum AudioUtils {
     static let targetSampleRate: Double = 16_000
 
     /// Decode any AVFoundation-readable file into 16 kHz mono Float32 PCM samples.
+    /// Streams in chunks instead of loading the whole file → working set stays bounded
+    /// (peak ~1 MB of buffers + the result array, vs. previously holding the full source
+    /// + full output + return copy = ~1.8 GB for a 1h 48k stereo file).
     static func loadAndResample(from url: URL) throws -> [Float] {
         let file = try AVAudioFile(forReading: url)
         let inFormat = file.processingFormat
@@ -15,38 +18,59 @@ enum AudioUtils {
             interleaved: false
         ) else { throw AudioError.formatUnavailable }
 
-        let frameCapacity = AVAudioFrameCount(file.length)
-        guard let inBuffer = AVAudioPCMBuffer(pcmFormat: inFormat, frameCapacity: frameCapacity) else {
-            throw AudioError.bufferAllocFailed
-        }
-        try file.read(into: inBuffer)
-
         guard let converter = AVAudioConverter(from: inFormat, to: outFormat) else {
             throw AudioError.formatUnavailable
         }
 
-        // Estimate output capacity (resample ratio + small slack)
+        // ~2s of input at typical sample rates — enough to amortize converter call overhead,
+        // small enough to keep memory low.
+        let inChunkFrames: AVAudioFrameCount = 96_000
         let ratio = outFormat.sampleRate / inFormat.sampleRate
-        let outCapacity = AVAudioFrameCount(Double(inBuffer.frameLength) * ratio + 1024)
-        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outCapacity) else {
-            throw AudioError.bufferAllocFailed
-        }
+        let outChunkFrames = AVAudioFrameCount(Double(inChunkFrames) * ratio + 1024)
 
-        var consumed = false
+        guard let inBuffer = AVAudioPCMBuffer(pcmFormat: inFormat, frameCapacity: inChunkFrames),
+              let outBuffer = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: outChunkFrames)
+        else { throw AudioError.bufferAllocFailed }
+
+        let estimatedTotal = Int(Double(file.length) * ratio + 1024)
+        var result = [Float](); result.reserveCapacity(estimatedTotal)
+
+        var fileExhausted = false
         var error: NSError?
-        let status = converter.convert(to: outBuffer, error: &error) { _, outStatus in
-            if consumed { outStatus.pointee = .endOfStream; return nil }
-            consumed = true
-            outStatus.pointee = .haveData
-            return inBuffer
-        }
-        if status == .error || error != nil {
-            throw AudioError.conversionFailed(error?.localizedDescription ?? "unknown")
-        }
 
-        guard let channelData = outBuffer.floatChannelData?[0] else { return [] }
-        let count = Int(outBuffer.frameLength)
-        return Array(UnsafeBufferPointer(start: channelData, count: count))
+        while true {
+            outBuffer.frameLength = 0
+            let status = converter.convert(to: outBuffer, error: &error) { _, outStatus in
+                if fileExhausted {
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                do {
+                    try file.read(into: inBuffer, frameCount: inChunkFrames)
+                } catch {
+                    fileExhausted = true
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                if inBuffer.frameLength == 0 {
+                    fileExhausted = true
+                    outStatus.pointee = .endOfStream
+                    return nil
+                }
+                outStatus.pointee = .haveData
+                return inBuffer
+            }
+            if status == .error {
+                throw AudioError.conversionFailed(error?.localizedDescription ?? "unknown")
+            }
+            if let chan = outBuffer.floatChannelData?[0], outBuffer.frameLength > 0 {
+                let count = Int(outBuffer.frameLength)
+                result.append(contentsOf: UnsafeBufferPointer(start: chan, count: count))
+            }
+            if status == .endOfStream { break }
+            if status == .inputRanDry, fileExhausted { break }
+        }
+        return result
     }
 
     /// Write Float32 mono samples at 16 kHz as a WAV file (Core Audio fmt = LinearPCM).
@@ -101,17 +125,19 @@ enum AudioUtils {
         let windowSamples = max(1, Int(windowSec * sr))
         guard samples.count >= windowSamples else { return [] }
 
-        // Per-window RMS
-        var rms: [Float] = []
-        rms.reserveCapacity(samples.count / windowSamples + 1)
-        var i = 0
-        while i + windowSamples <= samples.count {
-            var sumSq: Float = 0
-            for j in 0..<windowSamples { let v = samples[i + j]; sumSq += v * v }
-            rms.append(Foundation.sqrt(sumSq / Float(windowSamples)))
-            i += windowSamples
+        // Per-window RMS via vDSP — ~10× faster than scalar Swift loop on 1h audio.
+        let windowCount = samples.count / windowSamples
+        guard windowCount > 0 else { return [] }
+        var rms = [Float](repeating: 0, count: windowCount)
+        let invWindow = 1.0 / Float(windowSamples)
+        samples.withUnsafeBufferPointer { srcPtr in
+            guard let base = srcPtr.baseAddress else { return }
+            for w in 0..<windowCount {
+                var sumSq: Float = 0
+                vDSP_svesq(base.advanced(by: w * windowSamples), 1, &sumSq, vDSP_Length(windowSamples))
+                rms[w] = Foundation.sqrt(sumSq * invWindow)
+            }
         }
-        guard !rms.isEmpty else { return [] }
 
         // Adaptive threshold: 3× noise-floor (10th percentile), with hard floor.
         let sorted = rms.sorted()

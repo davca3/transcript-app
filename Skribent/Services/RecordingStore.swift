@@ -50,6 +50,7 @@ final class RecordingStore: ObservableObject {
         return dir
     }
     private var indexURL: URL { AppPaths.appSupport.appendingPathComponent("recordings.json") }
+    private var saveDebounceTask: Task<Void, Never>?
 
     init() { load() }
 
@@ -65,6 +66,7 @@ final class RecordingStore: ObservableObject {
     }
 
     func save() {
+        saveDebounceTask?.cancel(); saveDebounceTask = nil
         do {
             let data = try JSONEncoder().encode(recordings)
             try data.write(to: indexURL, options: .atomic)
@@ -73,13 +75,27 @@ final class RecordingStore: ObservableObject {
         }
     }
 
-    func upsert(_ rec: Recording) {
+    /// Debounced save (300ms). Coalesces rapid sequential upserts (e.g. pipeline stage updates)
+    /// into a single disk write. Latest call wins. UI publish is unaffected.
+    private func scheduleSave() {
+        saveDebounceTask?.cancel()
+        saveDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.save()
+        }
+    }
+
+    /// Insert or update a recording. By default the disk persist is debounced — pass
+    /// `persistImmediately: true` for terminal states or new inserts where you want the index
+    /// on disk immediately (crash recovery).
+    func upsert(_ rec: Recording, persistImmediately: Bool = false) {
         if let idx = recordings.firstIndex(where: { $0.id == rec.id }) {
             recordings[idx] = rec
         } else {
             recordings.insert(rec, at: 0)
         }
-        save()
+        if persistImmediately { save() } else { scheduleSave() }
     }
 
     func delete(_ id: UUID) {

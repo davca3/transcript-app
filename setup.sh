@@ -25,6 +25,14 @@ fi
 echo "▸ Generating Skribent.xcodeproj"
 xcodegen generate
 
+# 2b. Install shared debug breakpoints (xcodegen wipes the .xcodeproj, so we re-install).
+if [ -f "debug/Breakpoints_v2.xcbkptlist" ]; then
+  BPT_DIR="Skribent.xcodeproj/xcshareddata/xcdebugger"
+  mkdir -p "$BPT_DIR"
+  cp debug/Breakpoints_v2.xcbkptlist "$BPT_DIR/"
+  echo "▸ Installed shared breakpoints (catches Swift runtime warnings)"
+fi
+
 cat <<EOF
 
 ✓ Setup complete.

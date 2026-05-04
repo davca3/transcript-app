@@ -6,9 +6,16 @@ struct SpeakerChip: View {
     let onRename: () -> Void
     let onMerge: (UUID) -> Void
     let onUnassign: () -> Void
+    let onJumpToNext: () -> Void
 
     var body: some View {
         Menu {
+            Button {
+                onJumpToNext()
+            } label: {
+                Label("Skoč na další pasáž", systemImage: "forward.end.fill")
+            }
+            Divider()
             Button("Přejmenovat…") { onRename() }
             if assignment.speakerId != nil {
                 Button("Odebrat jméno (zpět na Speaker N)") { onUnassign() }

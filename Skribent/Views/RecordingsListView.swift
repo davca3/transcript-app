@@ -1,23 +1,34 @@
 import SwiftUI
 
 struct RecordingsListView: View {
-    @EnvironmentObject var state: AppState
+    @EnvironmentObject var recordings: RecordingStore
     @Binding var selection: UUID?
 
     var body: some View {
         List(selection: $selection) {
-            ForEach(state.recordings.recordings) { rec in
+            ForEach(recordings.recordings) { rec in
                 RecordingRow(recording: rec)
                     .tag(rec.id)
                     .contextMenu {
                         Button("Smazat", role: .destructive) {
-                            state.recordings.delete(rec.id)
-                            if selection == rec.id { selection = nil }
+                            delete(rec.id)
+                        }
+                    }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        Button(role: .destructive) {
+                            delete(rec.id)
+                        } label: {
+                            Label("Smazat", systemImage: "trash")
                         }
                     }
             }
         }
         .listStyle(.sidebar)
+    }
+
+    private func delete(_ id: UUID) {
+        recordings.delete(id)
+        if selection == id { selection = nil }
     }
 }
 
