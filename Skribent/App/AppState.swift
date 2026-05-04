@@ -55,7 +55,36 @@ final class AppState: ObservableObject {
         #if canImport(FluidAudio)
         Task { await fluid.preload() }
         #endif
+
+        #if DEBUG
+        instrumentPublishers()
+        #endif
     }
+
+    #if DEBUG
+    /// Subscribes to every key ObservableObject's `objectWillChange` and prints a short
+    /// stack trace. Used to pinpoint the source of "Publishing changes from within view
+    /// updates" warnings — when the warning fires, the preceding [Pub] line names the
+    /// publisher and the trace shows where the publish originated.
+    private func instrumentPublishers() {
+        func instrument(_ name: String, _ pub: ObservableObjectPublisher) {
+            pub.sink { _ in
+                print("[Pub] \(name)")
+                for sym in Thread.callStackSymbols.dropFirst().prefix(8) {
+                    print("    \(sym)")
+                }
+            }.store(in: &cancellables)
+        }
+        instrument("AppState", objectWillChange)
+        instrument("RecordingStore", recordings.objectWillChange)
+        instrument("SpeakerStore", speakers.objectWillChange)
+        instrument("AudioRecorder", recorder.objectWillChange)
+        instrument("WhisperKitTranscriber", transcriber.objectWillChange)
+        #if canImport(FluidAudio)
+        instrument("FluidAudioDiarizer", diarizer.objectWillChange)
+        #endif
+    }
+    #endif
 
     func processNewRecording(sourceURL: URL, title: String, kind: Recording.SourceKind) {
         Task {
