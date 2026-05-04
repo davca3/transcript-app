@@ -7,8 +7,39 @@ final class AppState: ObservableObject {
     let recordings = RecordingStore()
     let recorder = AudioRecorder()
 
+    #if DEBUG
+    private var _selectedRecordingId: UUID?
+    var selectedRecordingId: UUID? {
+        get { _selectedRecordingId }
+        set {
+            print("[Set] AppState.selectedRecordingId = \(String(describing: newValue))")
+            for sym in Thread.callStackSymbols.dropFirst().prefix(20) {
+                let marker = sym.contains("Combine") || sym.contains("libdispatch") ? "    " : " >> "
+                print(marker + sym)
+            }
+            print("---")
+            objectWillChange.send()
+            _selectedRecordingId = newValue
+        }
+    }
+    private var _globalError: String?
+    var globalError: String? {
+        get { _globalError }
+        set {
+            print("[Set] AppState.globalError = \(String(describing: newValue))")
+            for sym in Thread.callStackSymbols.dropFirst().prefix(20) {
+                let marker = sym.contains("Combine") || sym.contains("libdispatch") ? "    " : " >> "
+                print(marker + sym)
+            }
+            print("---")
+            objectWillChange.send()
+            _globalError = newValue
+        }
+    }
+    #else
     @Published var selectedRecordingId: UUID?
     @Published var globalError: String?
+    #endif
 
     let pipeline: PipelineCoordinator
     let transcriber: WhisperKitTranscriber
@@ -62,17 +93,21 @@ final class AppState: ObservableObject {
     }
 
     #if DEBUG
-    /// Subscribes to every key ObservableObject's `objectWillChange` and prints a short
-    /// stack trace. Used to pinpoint the source of "Publishing changes from within view
-    /// updates" warnings — when the warning fires, the preceding [Pub] line names the
-    /// publisher and the trace shows where the publish originated.
+    /// Subscribes to every key ObservableObject's `objectWillChange` and prints a stack
+    /// trace deep enough to reach Skribent / SwiftUI call-sites (the first ~8 frames are
+    /// always Combine internals). Used to pinpoint the source of "Publishing changes from
+    /// within view updates" warnings.
     private func instrumentPublishers() {
         func instrument(_ name: String, _ pub: ObservableObjectPublisher) {
             pub.sink { _ in
+                let frames = Thread.callStackSymbols.dropFirst().prefix(30)
                 print("[Pub] \(name)")
-                for sym in Thread.callStackSymbols.dropFirst().prefix(8) {
-                    print("    \(sym)")
+                for sym in frames {
+                    // Highlight non-Combine frames so the call-site jumps out.
+                    let marker = sym.contains("Combine") ? "    " : " >> "
+                    print(marker + sym)
                 }
+                print("---")
             }.store(in: &cancellables)
         }
         instrument("AppState", objectWillChange)
