@@ -6,9 +6,22 @@ struct ContentView: View {
     @State private var showNewRecording = false
     @State private var showSpeakerManagement = false
 
+    /// Local mirror of `state.selectedRecordingId`. SwiftUI's `List(selection:)` on macOS
+    /// is backed by NSOutlineView, whose `outlineViewSelectionDidChange` notification is
+    /// dispatched inside `Update.ensure { ... }` — i.e. *inside* a SwiftUI view-update
+    /// transaction. If the binding writes straight into AppState's `@Published`
+    /// `selectedRecordingId`, the resulting `objectWillChange.send()` happens during the
+    /// update and triggers "Publishing changes from within view updates" — confirmed via
+    /// stack trace from `OutlineListCoordinator → Binding.wrappedValue.set → AppState`.
+    /// `@State` writes go through SwiftUI's internal storage (no Combine), so they're
+    /// safe inside that callback. Two `onChange` handlers below sync this back and forth
+    /// with AppState *outside* the update transaction, so programmatic selection changes
+    /// (e.g. `processNewRecording` selecting a freshly created recording) still work.
+    @State private var sidebarSelection: UUID?
+
     var body: some View {
         NavigationSplitView {
-            RecordingsListView(selection: $state.selectedRecordingId)
+            RecordingsListView(selection: $sidebarSelection)
                 .navigationSplitViewColumnWidth(min: 240, ideal: 280)
         } detail: {
             VStack(spacing: 0) {
@@ -16,8 +29,15 @@ struct ContentView: View {
                 #if canImport(FluidAudio)
                 DiarizerStatusBanner(diarizer: state.diarizer)
                 #endif
-                SelectedRecordingDetail(selectedId: state.selectedRecordingId)
+                SelectedRecordingDetail(selectedId: sidebarSelection)
             }
+        }
+        .onAppear { sidebarSelection = state.selectedRecordingId }
+        .onChange(of: sidebarSelection) { _, new in
+            if state.selectedRecordingId != new { state.selectedRecordingId = new }
+        }
+        .onChange(of: state.selectedRecordingId) { _, new in
+            if sidebarSelection != new { sidebarSelection = new }
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
@@ -69,13 +89,10 @@ private struct SelectedRecordingDetail: View {
     var body: some View {
         if let id = selectedId,
            let rec = recordings.recordings.first(where: { $0.id == id }) {
-            // .id(rec.id) forces SwiftUI to fully tear down the previous detail and create
-            // a fresh one on every recording switch. Without it, SwiftUI reuses the same
-            // view instance and merely re-runs `.task(id:)`, which races with the in-flight
-            // sidebar-selection update transaction and produces "Publishing changes from
-            // within view updates" warnings (the @State writes inside the task body publish
-            // before the prior transaction commits). Recreation isolates each recording's
-            // @StateObject player + @State artifact lifecycle cleanly.
+            // .id(rec.id) tears the detail down on each recording switch so the player /
+            // artifact / autoFollow lifecycle is cleanly isolated per recording — the
+            // previous view's @StateObject player and @State artifact don't leak into the
+            // next one.
             RecordingDetailView(recording: rec).id(rec.id)
         } else {
             EmptyDetailView()
