@@ -1,6 +1,7 @@
 import Foundation
 
-/// Orchestrates: source audio → 16k mono PCM → transcribe → diarize → embed → identify → persist.
+/// Orchestrates: source audio → 48 kHz mono → cleanup (HPF + loudness) → store WAV →
+/// resample to 16 kHz → transcribe + diarize → embed → identify → persist.
 @MainActor
 final class PipelineCoordinator {
     private let transcriber: TranscriptionService
@@ -28,14 +29,17 @@ final class PipelineCoordinator {
 
     /// Run the full pipeline on a source audio URL. The audio gets resampled to 16k mono and
     /// stored alongside the recording. Reports progress through the recording's status.
+    /// Caller may pre-supply `id` so it can register a cancellable Task before the recording
+    /// is upserted into the store; defaults to a fresh UUID for callers that don't care.
     func process(
+        id: UUID = UUID(),
         sourceURL: URL,
         title: String,
         sourceKind: Recording.SourceKind,
         progress: @escaping (Recording) -> Void
     ) async {
         var rec = Recording(
-            id: UUID(),
+            id: id,
             title: title,
             createdAt: Date(),
             duration: 0,
@@ -45,12 +49,51 @@ final class PipelineCoordinator {
         try? FileManager.default.createDirectory(at: rec.folderURL, withIntermediateDirectories: true)
 
         do {
-            rec.status = .running(stage: .decoding, progress: 0.1)
+            try Task.checkCancellation()
+            rec.status = .running(stage: .decoding, progress: 0.05)
             recordings.upsert(rec, persistImmediately: true); progress(rec)  // first insert → flush
-            let samples = try AudioUtils.loadAndResample(from: sourceURL)
-            rec.duration = TimeInterval(samples.count) / AudioUtils.targetSampleRate
-            try AudioUtils.writeWav(samples: samples, to: rec.audioURL)
-            try await runStages(samples: samples, rec: &rec, progress: progress)
+
+            // Load at 48 kHz so the on-disk WAV plays back fully-bandwidth.
+            var samples48k = try AudioUtils.loadAndResample(from: sourceURL, sampleRate: AudioUtils.storedSampleRate)
+            rec.duration = TimeInterval(samples48k.count) / AudioUtils.storedSampleRate
+
+            rec.status = .running(stage: .enhancing, progress: 0.1)
+            recordings.upsert(rec); progress(rec)
+            let cleanT0 = Date()
+
+            // Stage 1: HPF on the shared buffer. Removes rumble that hurts both playback and
+            // Whisper, but preserves the speech-vs-silence energy contrast that the silence-trim
+            // VAD relies on.
+            AudioUtils.applyHighPassFilter(
+                samples: &samples48k,
+                cutoffHz: 80,
+                sampleRate: AudioUtils.storedSampleRate
+            )
+
+            // Pipeline branch: resample HPF'd-only audio to 16 kHz. Critically, no loudness
+            // normalize here — the RMS-target gain compresses the speech-vs-noise dynamic
+            // range that `AudioUtils.detectSpeech` reads as the "noise floor" to set its
+            // adaptive threshold. With normalize applied, the trim was wiping out 99 % of
+            // legitimate speech.
+            let pipelineSamples = try AudioUtils.resample(
+                samples: samples48k,
+                from: AudioUtils.storedSampleRate,
+                to: AudioUtils.targetSampleRate
+            )
+
+            // Storage branch: ALSO loudness-normalize so the saved WAV plays back at a
+            // consistent listening level. Mutates the 48 kHz buffer in place — by the time
+            // we write the WAV, the pipeline branch is already a separate copy at 16 kHz.
+            AudioUtils.loudnessNormalize(samples: &samples48k)
+            print(String(format: "[Pipeline] cleanup done in %.2fs", Date().timeIntervalSince(cleanT0)))
+            try AudioUtils.writeWav(samples: samples48k, to: rec.audioURL, sampleRate: AudioUtils.storedSampleRate)
+
+            try Task.checkCancellation()
+            try await runStages(samples: pipelineSamples, rec: &rec, progress: progress)
+        } catch is CancellationError {
+            rec.status = .failed(message: "Zrušeno uživatelem")
+            recordings.upsert(rec, persistImmediately: true); progress(rec)
+            print("[Pipeline] process cancelled by user")
         } catch {
             rec.status = .failed(message: error.localizedDescription)
             recordings.upsert(rec, persistImmediately: true); progress(rec)
@@ -59,13 +102,20 @@ final class PipelineCoordinator {
 
     /// Re-run transcription/diarization/identification on an existing recording's stored audio.
     /// Overwrites the prior transcript artifact. Speaker DB is unchanged.
+    /// Skips cleanup — the stored WAV is already the cleaned version.
     func reprocess(_ recording: Recording, progress: @escaping (Recording) -> Void) async {
         var rec = recording
         do {
+            try Task.checkCancellation()
             rec.status = .running(stage: .decoding, progress: 0.05)
             recordings.upsert(rec); progress(rec)
             let samples = try AudioUtils.loadAndResample(from: rec.audioURL)
+            try Task.checkCancellation()
             try await runStages(samples: samples, rec: &rec, progress: progress)
+        } catch is CancellationError {
+            rec.status = .failed(message: "Zrušeno uživatelem")
+            recordings.upsert(rec, persistImmediately: true); progress(rec)
+            print("[Pipeline] reprocess cancelled by user")
         } catch {
             rec.status = .failed(message: error.localizedDescription)
             recordings.upsert(rec, persistImmediately: true); progress(rec)
@@ -92,11 +142,12 @@ final class PipelineCoordinator {
         print(String(format: "[Pipeline] silence-trim: %.1fs → %.1fs (saved %d%%)",
                      originalDur, trimmedDur, savedPct))
 
-        // Estimate parallel wall time. On M1 Pro, observed:
+        // Estimate parallel wall time. On M1 Pro, observed (after chunked-parallel diarize):
         //   - Whisper turbo + parallel workers ≈ 25× realtime on trimmed audio
-        //   - FluidAudio pyannote ≈ 4× realtime on trimmed audio (the slower of the two)
+        //   - FluidAudio pyannote chunked across 6 parallel tasks ≈ 12–15× realtime
+        // We use 12× as a slightly pessimistic estimate so the bar doesn't pin to 100% early.
         let transcribeEstimate = trimmedDur / 25.0
-        let diarizeEstimate = trimmedDur / 4.0
+        let diarizeEstimate = trimmedDur / 12.0
         let parallelEstimate = Swift.max(transcribeEstimate, diarizeEstimate, 1.0)
         let parallelStart = Date()
         let recId = rec.id

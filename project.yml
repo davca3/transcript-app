@@ -2,7 +2,7 @@ name: Skribent
 options:
   bundleIdPrefix: com.skribent
   deploymentTarget:
-    macOS: "14.0"
+    macOS: "26.0"
   createIntermediateGroups: true
   groupSortPosition: top
 
@@ -22,6 +22,15 @@ packages:
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio
     from: "0.6.0"
+  MLXSwiftLM:
+    url: https://github.com/ml-explore/mlx-swift-lm
+    branch: main
+  swift-transformers:
+    url: https://github.com/huggingface/swift-transformers
+    from: "1.1.6"
+  swift-huggingface:
+    url: https://github.com/huggingface/swift-huggingface
+    branch: main
 
 targets:
   Skribent:
@@ -41,7 +50,7 @@ targets:
         CFBundleDisplayName: Skribent
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        LSMinimumSystemVersion: "14.0"
+        LSMinimumSystemVersion: "26.0"
         NSMicrophoneUsageDescription: "Skribent potřebuje přístup k mikrofonu pro nahrávání přepisů."
         NSHighResolutionCapable: true
     entitlements:
@@ -60,3 +69,15 @@ targets:
     dependencies:
       - package: WhisperKit
       - package: FluidAudio
+      - package: MLXSwiftLM
+        product: MLXLLM
+      - package: MLXSwiftLM
+        product: MLXLMCommon
+      - package: MLXSwiftLM
+        product: MLXHuggingFace
+      - package: swift-transformers
+        product: Hub
+      - package: swift-transformers
+        product: Tokenizers
+      - package: swift-huggingface
+        product: HuggingFace

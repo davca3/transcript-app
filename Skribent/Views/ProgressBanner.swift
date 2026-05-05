@@ -2,6 +2,13 @@ import SwiftUI
 
 struct ProgressBanner: View {
     let status: Recording.ProcessingStatus
+    /// Optional secondary detail line (e.g. "3.4 GB z 7.0 GB" during model download). Rendered
+    /// as a small caption under the progress bar. nil = no extra line.
+    var detail: String? = nil
+    /// Optional cancel handler. When provided + status is `.running`, the banner shows a
+    /// "Zrušit" button that calls this closure. The actual task cancellation is handled by
+    /// the caller (typically `AppState.cancelProcessing(for:)`).
+    var onCancel: (() -> Void)? = nil
 
     /// Reset point: when status flips into .running we capture Date.now and use it for
     /// elapsed/ETA derivation. We also track the previous progress so jumping backwards
@@ -20,7 +27,16 @@ struct ProgressBanner: View {
             case .running(let stage, let p):
                 let elapsed = startedAt.map { now.timeIntervalSince($0) }
                 let eta = etaSeconds(progress: p, elapsed: elapsed)
-                bar(label: stageLabel(stage), progress: p, tint: .blue, eta: eta, elapsed: elapsed)
+                let isIndeterminate = stage == .loadingModel
+                bar(
+                    label: stageLabel(stage),
+                    progress: p,
+                    indeterminate: isIndeterminate,
+                    tint: .blue,
+                    eta: isIndeterminate ? nil : eta,
+                    elapsed: elapsed,
+                    detail: detail
+                )
             case .failed(let msg):
                 HStack(spacing: 10) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
@@ -56,23 +72,43 @@ struct ProgressBanner: View {
     private func bar(
         label: String,
         progress: Double,
+        indeterminate: Bool = false,
         tint: Color,
         eta: TimeInterval?,
-        elapsed: TimeInterval?
+        elapsed: TimeInterval?,
+        detail: String? = nil
     ) -> some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(label).font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    Text("\(Int(progress * 100)) %")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    if !indeterminate {
+                        Text("\(Int(progress * 100)) %")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    if let onCancel {
+                        Button("Zrušit", action: onCancel)
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                            .foregroundStyle(.red)
+                            .help("Zrušit probíhající operaci. Audio a stávající přepis zůstanou nedotčené.")
+                    }
                 }
-                ProgressView(value: progress).progressViewStyle(.linear).tint(tint)
+                if indeterminate {
+                    ProgressView().progressViewStyle(.linear).tint(tint)
+                } else {
+                    ProgressView(value: progress).progressViewStyle(.linear).tint(tint)
+                }
                 HStack(spacing: 8) {
                     if let elapsed {
                         Label(format(elapsed), systemImage: "clock")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+                    if let detail {
+                        Text(detail)
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
@@ -101,9 +137,13 @@ struct ProgressBanner: View {
     private func stageLabel(_ stage: Recording.ProcessingStatus.Stage) -> String {
         switch stage {
         case .decoding: return "Dekóduji audio…"
+        case .enhancing: return "Vylepšuji zvuk…"
         case .transcribing: return "Přepisuji řeč (Whisper)…"
         case .diarizing: return "Rozděluji mluvčí (pyannote)…"
         case .identifying: return "Rozpoznávám známé hlasy…"
+        case .downloadingModel: return "Stahuji Mistral Nemo (~7 GB, jednorázově)…"
+        case .loadingModel: return "Načítám Mistral Nemo do paměti…"
+        case .refining: return "Vylepšuji přepis (Mistral Nemo)…"
         }
     }
 

@@ -25,8 +25,16 @@ struct RecordingDetailView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            ProgressBanner(status: recording.status)
-            if artifact != nil {
+            ProgressBanner(
+                status: recording.status,
+                detail: state.processingDetail,
+                onCancel: { state.cancelProcessing(for: recording) }
+            )
+            // Show the player whenever the cleaned WAV exists on disk — independent of the
+            // transcript artifact. This lets the user preview the enhanced recording (HPF +
+            // loudness-normalized) even mid-processing or when transcription failed/produced
+            // no segments.
+            if FileManager.default.fileExists(atPath: recording.audioURL.path) {
                 TransportBar(player: player, progress: player.progress, autoFollow: $autoFollow)
             }
             speakerChips
@@ -75,6 +83,15 @@ struct RecordingDetailView: View {
                     Label("Přegenerovat transcript", systemImage: "arrow.clockwise.circle")
                 }
                 .help("Spustí znovu transkripci a diarizaci na uložené nahrávce. Přepíše stávající přepis.")
+                .disabled(isProcessing)
+            }
+            if artifact != nil {
+                Button {
+                    state.refineTranscript(for: recording)
+                } label: {
+                    Label("Vyčistit přepis", systemImage: "wand.and.stars")
+                }
+                .help("Lokální Mistral Nemo 12B model (in-app, MLX) projde přepis a opraví zjevné chyby rozpoznávání pomocí kontextu. Zachovává anglické technické termy. První spuštění stáhne ~7 GB.")
                 .disabled(isProcessing)
             }
             if artifact != nil {

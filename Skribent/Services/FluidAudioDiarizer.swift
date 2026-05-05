@@ -53,30 +53,114 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
 
     // MARK: - DiarizationService
 
+    /// Chunk length for parallel diarization. 3 min keeps enough speech context for stable
+    /// cluster embeddings while small enough that even 10–15 min recordings get 4–5 chunks.
+    private static let parallelChunkSeconds: Double = 180
+
+    /// Max concurrent `performCompleteDiarization` calls. Each call holds ~1.5–2 GB peak — 6
+    /// fits on M-series with 16 GB+ unified memory and keeps perf cores + ANE saturated.
+    private static let parallelMaxConcurrent = 6
+
     func diarize(samples: [Float]) async throws -> [SpeakerTurn] {
         let m = try await ensureLoaded()
-        print("[FluidAudio] diarize \(samples.count) samples (\(String(format: "%.1f", Double(samples.count) / 16000))s)")
+        let durationSec = Double(samples.count) / 16000
+        print("[FluidAudio] diarize \(samples.count) samples (\(String(format: "%.1f", durationSec))s)")
         let t0 = Date()
 
-        let result = try await m.performCompleteDiarization(samples, sampleRate: Int(AudioUtils.targetSampleRate))
-        print("[FluidAudio] diarize done in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s, segments=\(result.segments.count)")
+        // Short audio: no benefit from chunking — single call is faster (no overhead, larger
+        // clustering context). Threshold = 1.5× chunk so we don't split a "1 chunk + 30s tail".
+        let chunkSec = Self.parallelChunkSeconds
+        if durationSec < chunkSec * 1.5 {
+            let result = try await m.performCompleteDiarization(samples, sampleRate: Int(AudioUtils.targetSampleRate))
+            print("[FluidAudio] diarize done (single) in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s, segments=\(result.segments.count)")
+            return mapSegments(result.segments, chunkIndex: 0)
+        }
 
-        // FluidAudio gives string speaker IDs ("Speaker 1", "Speaker 2", ...) — map to ints stably.
-        var idMap: [String: Int] = [:]
-        var nextId = 0
-        return result.segments.map { seg in
-            let cid: Int
-            if let existing = idMap[seg.speakerId] {
-                cid = existing
-            } else {
-                cid = nextId
-                idMap[seg.speakerId] = cid
-                nextId += 1
+        // Build chunk ranges. Last chunk absorbs any remainder (so we never have a tiny tail < ~30s
+        // with too little speech context for clustering).
+        let chunkSamples = Int(chunkSec * AudioUtils.targetSampleRate)
+        var ranges: [(idx: Int, start: Int, end: Int)] = []
+        var s = 0
+        var i = 0
+        while s < samples.count {
+            let remaining = samples.count - s
+            let take = remaining < chunkSamples + chunkSamples / 2 ? remaining : chunkSamples
+            ranges.append((i, s, s + take))
+            s += take
+            i += 1
+        }
+
+        let maxConcurrent = Self.parallelMaxConcurrent
+        print("[FluidAudio] parallel diarize: \(ranges.count) chunk(s) of ~\(Int(chunkSec))s, max \(maxConcurrent) concurrent")
+
+        // Throttled task group: keep at most `maxConcurrent` chunks in flight so RAM peak stays
+        // bounded on long recordings. Order doesn't matter — turns are unioned.
+        var collected: [SpeakerTurn] = []
+        try await withThrowingTaskGroup(of: [SpeakerTurn].self) { group in
+            var inFlight = 0
+            var iter = ranges.makeIterator()
+
+            func enqueueNext() {
+                guard let r = iter.next() else { return }
+                let chunkStartSec = TimeInterval(r.start) / TimeInterval(AudioUtils.targetSampleRate)
+                let chunkSlice = Array(samples[r.start..<r.end])
+                let idx = r.idx
+                group.addTask { [self] in
+                    let cT0 = Date()
+                    let result = try await m.performCompleteDiarization(
+                        chunkSlice,
+                        sampleRate: Int(AudioUtils.targetSampleRate),
+                        atTime: chunkStartSec
+                    )
+                    let elapsed = Date().timeIntervalSince(cT0)
+                    print(String(format: "[FluidAudio]   chunk %d: %.1fs audio → %.1fs wall (%.1f× rt), %d segments",
+                                 idx, Double(chunkSlice.count) / 16000, elapsed,
+                                 (Double(chunkSlice.count) / 16000) / max(elapsed, 0.01),
+                                 result.segments.count))
+                    return self.mapSegments(result.segments, chunkIndex: idx)
+                }
+                inFlight += 1
             }
+
+            for _ in 0..<min(maxConcurrent, ranges.count) { enqueueNext() }
+            while inFlight > 0 {
+                if let next = try await group.next() {
+                    collected.append(contentsOf: next)
+                    inFlight -= 1
+                    enqueueNext()
+                }
+            }
+        }
+
+        let elapsed = Date().timeIntervalSince(t0)
+        print(String(format: "[FluidAudio] parallel diarize done in %.1fs (%.1f× realtime), turns=%d",
+                     elapsed, durationSec / max(elapsed, 0.01), collected.count))
+        // Sort by start time so downstream stitching sees a chronological turn list.
+        collected.sort { $0.start < $1.start }
+        return collected
+    }
+
+    /// Map FluidAudio segments to `SpeakerTurn`s. `chunkIndex` namespaces cluster IDs so
+    /// per-chunk-local "Speaker 1" labels don't collide across chunks. Cross-chunk merging is
+    /// handled later by `PipelineCoordinator.mergeSimilarClusters` via cosine similarity.
+    /// `nonisolated` so parallel chunk tasks can call it off the main actor.
+    nonisolated private func mapSegments(_ segments: [TimedSpeakerSegment], chunkIndex: Int) -> [SpeakerTurn] {
+        var idMap: [String: Int] = [:]
+        var nextLocal = 0
+        return segments.map { seg in
+            let local: Int
+            if let existing = idMap[seg.speakerId] {
+                local = existing
+            } else {
+                local = nextLocal
+                idMap[seg.speakerId] = local
+                nextLocal += 1
+            }
+            let globalId = chunkIndex * 10_000 + local
             return SpeakerTurn(
                 start: TimeInterval(seg.startTimeSeconds),
                 end: TimeInterval(seg.endTimeSeconds),
-                clusterId: cid,
+                clusterId: globalId,
                 embedding: l2Normalize(seg.embedding)
             )
         }
@@ -100,7 +184,7 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
         throw DiarizationError.notReady
     }
 
-    private func l2Normalize(_ v: [Float]) -> [Float] {
+    nonisolated private func l2Normalize(_ v: [Float]) -> [Float] {
         var sum: Float = 0
         for x in v { sum += x * x }
         let n = sum.squareRoot()

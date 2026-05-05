@@ -19,3 +19,6 @@ Models/
 
 # User data
 UserData/
+
+# Local Xcode debug session state (custom breakpoints, etc.)
+debug/

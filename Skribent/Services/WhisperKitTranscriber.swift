@@ -1,3 +1,4 @@
+import CoreML
 import Foundation
 import WhisperKit
 
@@ -15,6 +16,12 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
 
     private var pipe: WhisperKit?
     private let modelName: String
+
+    /// UserDefaults key for the "Use Apple Neural Engine" toggle in Settings. ANE is
+    /// off by default because cold-start ANE compilation can take 5–15 minutes for the
+    /// large-v3-turbo model and looks indistinguishable from a hang to the user. Power
+    /// users can opt in via `Settings → Akcelerace přepisu`.
+    static let useANEDefaultsKey = "useAppleNeuralEngine"
 
     /// Default: Whisper Turbo (`large-v3` distilled). ~5–8× faster than full large-v3 with
     /// near-equivalent cs/en quality. Roughly 600 MB download on first run.
@@ -83,13 +90,24 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
         }
 
         // Load (no prewarm — hangs on sandboxed macOS for large models).
+        // ANE compute is opt-in via Settings: when off, force CPU+GPU on every stage to skip
+        // ANE AOT compilation (which can take 5–15 minutes on cold cache and is what makes the
+        // app look hung). When on, pass `nil` so WhisperKit picks its ANE-friendly defaults.
+        let useANE = UserDefaults.standard.bool(forKey: Self.useANEDefaultsKey)
+        let computeOptions: ModelComputeOptions? = useANE ? nil : ModelComputeOptions(
+            melCompute: .cpuAndGPU,
+            audioEncoderCompute: .cpuAndGPU,
+            textDecoderCompute: .cpuAndGPU,
+            prefillCompute: .cpuAndGPU
+        )
         state = .loadingIntoMemory
         let t1 = Date()
-        print("[WhisperKit] loading model into memory (prewarm disabled)…")
+        print("[WhisperKit] loading model into memory (prewarm disabled, ANE \(useANE ? "ENABLED" : "disabled"))…")
         do {
             let config = WhisperKitConfig(
                 model: modelName,
                 modelFolder: folderURL.path,
+                computeOptions: computeOptions,
                 verbose: true,
                 prewarm: false,
                 load: true,
