@@ -52,7 +52,7 @@ struct TransportBar: View {
             .help("Posouvá přepis podle aktuální pozice přehrávání. Vypne se, když ručně scrollneš.")
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
-        .background(Color.gray.opacity(0.06))
+        .background(Color.surfaceQuiet)
     }
 
 }

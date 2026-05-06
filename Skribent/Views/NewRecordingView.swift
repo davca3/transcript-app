@@ -103,7 +103,7 @@ struct NewRecordingView: View {
             }
         }
         .padding(12)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.gray.opacity(0.05)))
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.surfaceQuiet))
     }
 
     private static let dateFormatter: DateFormatter = {
@@ -131,7 +131,7 @@ private struct FileImportPanel: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.08)))
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.surface))
         .fileImporter(
             isPresented: $showImporter,
             allowedContentTypes: [.audio, .mp3, .wav, .mpeg4Audio],

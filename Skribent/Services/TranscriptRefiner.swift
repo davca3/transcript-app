@@ -323,7 +323,7 @@ final class TranscriptRefiner {
     private static let systemInstructions = """
     Jsi profesionální editor přepisů česko-anglických nahrávek. Whisper produkuje přepis se \
     spoustou chyb — fonetické deformace, vymyšlená slova, chybějící hlásky, špatné koncovky. \
-    Tvým úkolem JE je AGRESIVNĚ rekonstruovat do správné češtiny pomocí kontextu věty a okolí. \
+    Tvým úkolem JE je AGRESIVNĚ rekonstruovat do správné češtiny/angličtiny pomocí kontextu věty a okolí. \
     Nedělej jen kosmetické úpravy (čárky, velká písmena) — primárně oprav OBSAH slov.
 
     PRAVIDLO Č. 1 — REKONSTRUKCE FONETICKY DEFORMOVANÝCH SLOV:

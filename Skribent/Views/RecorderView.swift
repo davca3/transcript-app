@@ -46,7 +46,7 @@ struct RecorderView: View {
             }
         }
         .padding(24)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.08)))
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.surface))
     }
 
 }
@@ -64,7 +64,7 @@ private struct LevelMeter: View {
                     let threshold = Float(i) / Float(count)
                     let on = level > threshold
                     RoundedRectangle(cornerRadius: 2)
-                        .fill(on ? color(for: i, count: count) : Color.gray.opacity(0.18))
+                        .fill(on ? color(for: i, count: count) : Color.surfaceBorder)
                         .frame(width: barW)
                 }
             }

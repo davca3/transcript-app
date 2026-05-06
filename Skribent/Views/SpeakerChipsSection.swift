@@ -53,7 +53,7 @@ struct SpeakerChipsSection: View {
                     Text("Znovu rozpoznat")
                 }
                 .padding(.horizontal, 10).padding(.vertical, 6)
-                .background(Capsule().fill(Color.gray.opacity(0.10)))
+                .background(Capsule().fill(Color.surfaceMuted))
                 .overlay(Capsule().stroke(Color.secondary.opacity(0.2), lineWidth: 0.5))
             }
             .buttonStyle(.plain)

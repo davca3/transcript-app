@@ -37,7 +37,7 @@ struct SpeakerChip: View {
             }
             .padding(.horizontal, 10).padding(.vertical, 6)
             .background(
-                Capsule().fill(assignment.speakerId == nil ? Color.gray.opacity(0.18) : Color.accentColor.opacity(0.18))
+                Capsule().fill(assignment.speakerId == nil ? Color.surfaceBorder : Color.accentColor.opacity(0.18))
             )
             .overlay(
                 Capsule().stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)

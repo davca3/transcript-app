@@ -200,12 +200,17 @@ final class AppState: ObservableObject {
         return "\(formatter.string(fromByteCount: completed)) z \(formatter.string(fromByteCount: total))"
     }
 
-    /// LLM-assisted cleanup of an existing transcript via a local Qwen model running on Ollama.
-    /// Only updates the `text` field of each segment — timestamps + speaker assignments +
-    /// cluster embeddings are untouched. Replaces the artifact in place; we don't keep a backup
-    /// of the raw transcript (per user preference: just keep the refined output, no toggle).
+    /// LLM-assisted cleanup of an existing transcript via a local Qwen 2.5 7B model running
+    /// in-process via MLX. Only updates the `text` field of each segment — timestamps + speaker
+    /// assignments + cluster embeddings are untouched. Replaces the artifact in place; no backup
+    /// of the raw transcript is kept (per user preference: just keep the refined output, no toggle).
     /// Apple Intelligence was the original choice but doesn't yet support Czech; Qwen 2.5 / 3
     /// has solid CS support.
+    ///
+    /// First invocation triggers a one-time ~4.3 GB download of the model weights — banner
+    /// labels show the phase (.downloadingModel → .loadingModel → .refining). Cancel via
+    /// `cancelProcessing(for:)`; on cancel the original transcript is preserved untouched.
+    /// Pre-condition: recording must already have a persisted artifact (i.e. status `.done`).
     func refineTranscript(for recording: Recording) {
         let id = recording.id
         let task = Task { @MainActor [weak self] in
@@ -303,8 +308,16 @@ final class AppState: ObservableObject {
         inflightTasks[id] = task
     }
 
-    /// User renamed an unnamed speaker in a recording → promote to a named Speaker in DB,
-    /// then re-stitch the artifact so segments point to the new speakerId.
+    /// User named an unnamed cluster in a recording → promote to a named `Speaker` in the DB
+    /// and re-stitch the artifact so the cluster's segments now point at the new `speakerId`.
+    ///
+    /// Idempotent on duplicate names: if a speaker with the same name (case-insensitive) already
+    /// exists, the cluster's embedding is appended to that existing speaker (treated as a merge).
+    /// Otherwise creates a fresh `Speaker` seeded with this cluster's embedding.
+    /// - Parameters:
+    ///   - recording: target recording (must have a persisted artifact).
+    ///   - clusterId: the cluster being promoted (matches `RecordingArtifact.clusterAssignments` key).
+    ///   - newName: user-supplied name; whitespace-trimmed, no-op on empty.
     func promoteUnnamed(in recording: Recording, clusterId: Int, newName: String) {
         guard var artifact = recordings.loadArtifact(for: recording),
               let stored = artifact.assignment(for: clusterId) else { return }
@@ -341,7 +354,8 @@ final class AppState: ObservableObject {
         recordings.saveArtifact(artifact, for: recording)
     }
 
-    /// User renamed an already-known speaker.
+    /// User renamed an already-known speaker. Updates the DB; live `displayNames(...)` lookups
+    /// pull from there so all open recordings reflect the new name without re-stitching artifacts.
     func renameKnown(speakerId: UUID, to newName: String) {
         speakers.rename(speakerId, to: newName)
     }
@@ -376,8 +390,10 @@ final class AppState: ObservableObject {
         return matched
     }
 
-    /// Strip the named-speaker assignment from a cluster — segments revert to a fresh unnamed slot.
-    /// The cluster's embedding stays so the user can re-name or re-match it.
+    /// Strip the named-speaker assignment from a cluster — segments revert to a fresh
+    /// `UnnamedSpeakerID(clusterId:)` slot, displayed as "Speaker N" with a renumbered N.
+    /// The cluster's embedding is kept so the user can re-name or re-match it later.
+    /// No-op on already-unnamed clusters.
     func unassignCluster(in recording: Recording, clusterId: Int) {
         guard var artifact = recordings.loadArtifact(for: recording),
               let stored = artifact.assignment(for: clusterId),
@@ -400,7 +416,13 @@ final class AppState: ObservableObject {
         recordings.saveArtifact(artifact, for: recording)
     }
 
-    /// User added a sample to an existing speaker from a recording's cluster.
+    /// Add this cluster's embedding to an existing named speaker (treating it as another sample
+    /// of the same person) and re-stitch the artifact's segments to that speakerId. Useful when
+    /// the diarizer split one person across two clusters and the user wants to fix it manually.
+    /// - Parameters:
+    ///   - recording: target recording (must have a persisted artifact).
+    ///   - clusterId: source cluster (its embedding is the new sample).
+    ///   - speakerId: destination speaker in the DB.
     func mergeCluster(in recording: Recording, clusterId: Int, into speakerId: UUID) {
         guard var artifact = recordings.loadArtifact(for: recording),
               let stored = artifact.assignment(for: clusterId) else { return }

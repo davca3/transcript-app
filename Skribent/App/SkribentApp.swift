@@ -10,7 +10,7 @@ struct SkribentApp: App {
                 .environmentObject(state)
                 .environmentObject(state.recordings)
                 .environmentObject(state.speakers)
-                .frame(minWidth: 980, minHeight: 600)
+                .frame(minWidth: AppLayout.windowMinWidth, minHeight: AppLayout.windowMinHeight)
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unified)

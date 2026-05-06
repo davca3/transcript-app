@@ -22,7 +22,7 @@ struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             RecordingsListView(selection: $sidebarSelection)
-                .navigationSplitViewColumnWidth(min: 240, ideal: 280)
+                .navigationSplitViewColumnWidth(min: AppLayout.sidebarMinWidth, ideal: AppLayout.sidebarIdealWidth)
         } detail: {
             VStack(spacing: 0) {
                 ModelStatusBanner(transcriber: state.transcriber)
