@@ -23,22 +23,24 @@ import Tokenizers
 @MainActor
 final class TranscriptRefiner {
 
-    /// Mistral Nemo 12B Instruct 4-bit MLX. Picked over Qwen 3 8B because Czech tech meetings
-    /// are typically bilingual (CS prose with EN technical terms — "deploynem ten endpoint",
-    /// "nasdílím ten Slack channel"). Mistral has explicit European-language training data and
-    /// preserves EN code-switching verbatim where Qwen sometimes "translates" EN tech terms to
-    /// awkward CS equivalents. ~7 GB on disk, ~7 GB RAM, ~35 tokens/sec on M-series.
-    /// To swap quality/speed:
-    ///   - `LLMRegistry.qwen3_8b_4bit` (~5 GB, ~50 tok/s, slightly weaker CS naturalness)
-    ///   - `LLMRegistry.qwen3_4b_4bit` (~2.5 GB, ~80 tok/s, fastest)
-    static let modelRepoId = "mlx-community/Mistral-Nemo-Instruct-2407-4bit"
+    /// Qwen 2.5 7B Instruct 4-bit MLX. Picked over Mistral Nemo 12B 4-bit because Mistral at
+    /// 4-bit quantization was deterministically greedy ("copy input verbatim") — needed temp 0.5
+    /// to break out, which then introduced spurious changes ("tuhle" → "touhle"). Qwen 2.5 has
+    /// stronger instruction following at the same parameter scale and follows the few-shot prompt
+    /// reliably even at temp 0.3. Trade-off vs. Mistral: marginally weaker on EN code-switching
+    /// preservation, mitigated by explicit list in system prompt. ~4.3 GB on disk, ~4 GB RAM,
+    /// ~50 tokens/sec on M-series.
+    /// Other options if quality/speed needs to shift:
+    ///   - `mlx-community/Qwen2.5-14B-Instruct-4bit` (~8 GB, ~25 tok/s, better hard-case recovery)
+    ///   - `mlx-community/Qwen2.5-3B-Instruct-4bit` (~2 GB, ~80 tok/s, fastest, weaker reconstruction)
+    static let modelRepoId = "mlx-community/Qwen2.5-7B-Instruct-4bit"
     static let modelConfiguration = ModelConfiguration(id: modelRepoId)
 
     /// Estimated total download size for the configured model. Used as denominator for the
     /// disk-poll progress when HubClient hasn't yet reported `totalUnitCount` (it only fires
-    /// after listing the repo, which can take a few seconds). For Mistral Nemo 4-bit MLX the
-    /// repo is ~7.0 GB; if you swap models, update this estimate so the bar isn't off.
-    private static let estimatedTotalBytes: Int64 = 7_000_000_000
+    /// after listing the repo, which can take a few seconds). For Qwen 2.5 7B 4-bit MLX the
+    /// repo is ~4.3 GB; if you swap models, update this estimate so the bar isn't off.
+    private nonisolated static let estimatedTotalBytes: Int64 = 4_500_000_000
 
     /// Tiny lock-protected Int64 — used so the progress-poll task can safely read the
     /// HubClient-reported total while the resolve callback writes it. `os_unfair_lock` is the
@@ -140,16 +142,34 @@ final class TranscriptRefiner {
                     userPrompt: userPrompt
                 )
                 let elapsed = Date().timeIntervalSince(cT0)
+
+                // Diagnostic: dump raw LLM response so we can tell whether the model returned
+                // input verbatim (model issue) or something different that the parser later
+                // re-aligned to the original (parser issue). Truncated to 1200 chars.
+                let preview = response.count > 1200 ? String(response.prefix(1200)) + "\n…[truncated, total \(response.count) chars]" : response
+                print("[Refiner] chunk \(chunkIdx + 1)/\(totalChunks) raw response:\n\(preview)\n[Refiner] --- end of raw response ---")
+
                 let parsed = parseResponse(response, expectedCount: end - i)
-                if parsed.count == end - i {
-                    for (offset, newText) in parsed.enumerated() {
-                        refined[i + offset].text = newText
+                var changed = 0
+                var skipped = 0
+                for offset in 0..<(end - i) {
+                    let oldText = refined[i + offset].text
+                    guard let newText = parsed[offset] else {
+                        skipped += 1
+                        print("[Refiner]   [\(offset + 1)] PARSE FAILED — keeping original: \(oldText)")
+                        continue
                     }
-                    print(String(format: "[Refiner] chunk %d/%d: %d segments in %.2fs",
-                                 chunkIdx + 1, totalChunks, end - i, elapsed))
-                } else {
-                    print("[Refiner] chunk \(chunkIdx + 1)/\(totalChunks): parse failed (got \(parsed.count) of \(end - i)), keeping originals")
+                    if oldText != newText {
+                        changed += 1
+                        print("[Refiner]   [\(offset + 1)] CHANGED")
+                        print("[Refiner]     OLD: \(oldText)")
+                        print("[Refiner]     NEW: \(newText.isEmpty ? "(empty — segment will be dropped)" : newText)")
+                    }
+                    refined[i + offset].text = newText
                 }
+                let unchanged = (end - i) - changed - skipped
+                print(String(format: "[Refiner] chunk %d/%d: %d segments in %.2fs (%d changed, %d unchanged, %d parse-skipped)",
+                             chunkIdx + 1, totalChunks, end - i, elapsed, changed, unchanged, skipped))
             } catch {
                 print("[Refiner] chunk \(chunkIdx + 1)/\(totalChunks) FAILED: \(error) — keeping originals")
             }
@@ -159,7 +179,11 @@ final class TranscriptRefiner {
             i = end
         }
 
-        return Transcript(segments: refined, detectedLanguage: transcript.detectedLanguage)
+        // Drop segments the LLM blanked out (system prompt instructs it to return empty text
+        // for evidently-hallucinated content like "Děkuji za sledování"). The original
+        // Whisper run already filters empty segments, so anything blank here came from refine.
+        let cleaned = refined.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return Transcript(segments: cleaned, detectedLanguage: transcript.detectedLanguage)
     }
 
     // MARK: - Model loading
@@ -282,9 +306,12 @@ final class TranscriptRefiner {
             .user(userPrompt),
         ]
         let userInput = UserInput(chat: chat)
-        // Low temperature: we want corrections, not creative rewrites. Generous max tokens to
-        // accommodate the longest plausible chunk (15 segments × ~50 tokens × some margin).
-        let parameters = GenerateParameters(maxTokens: 4096, temperature: 0.2)
+        // Temperature 0.3: Qwen 2.5 follows few-shot prompts reliably without needing the
+        // 0.5 we had to use for Mistral Nemo. Lower temp = same correction depth + fewer
+        // hallucinated changes (Mistral at 0.5 sometimes "corrected" already-correct words,
+        // e.g. "tuhle" → "touhle"). Generous max tokens to accommodate the longest plausible
+        // chunk (15 segments × ~50 tokens × margin).
+        let parameters = GenerateParameters(maxTokens: 4096, temperature: 0.3)
 
         let lmInput = try await container.prepare(input: userInput)
         let stream = try await container.generate(input: lmInput, parameters: parameters)
@@ -301,21 +328,64 @@ final class TranscriptRefiner {
     // MARK: - Prompt building / parsing
 
     private static let systemInstructions = """
-    Jsi editor přepisů česky/anglicky mluvených nahrávek z tech meetingů. Tvůj úkol:
+    Jsi profesionální editor přepisů česko-anglických nahrávek. Whisper produkuje přepis se \
+    spoustou chyb — fonetické deformace, vymyšlená slova, chybějící hlásky, špatné koncovky. \
+    Tvým úkolem JE je AGRESIVNĚ rekonstruovat do správné češtiny pomocí kontextu věty a okolí. \
+    Nedělej jen kosmetické úpravy (čárky, velká písmena) — primárně oprav OBSAH slov.
 
-    1. Opravit zjevné chyby automatického rozpoznávání řeči — foneticky podobná slova, \
-    špatně rozpoznaná jména, chybné koncovky, překlepy — pomocí kontextu věty a okolních vět.
-    2. Zachovat smysl, tón a styl mluvčího. Nevymýšlej obsah. Nepřidávej a neodstraňuj informace.
-    3. **Anglické technické termy zachovej beze změny** (deploy, endpoint, API, repository, \
-    pull request, Slack, GitHub, frontend, backend, atd.). NEPŘEKLÁDEJ je do češtiny ani \
-    nečešti přes koncovky cizích slov, pokud to mluvčí sám neudělal. Code-switching CS/EN je \
-    v tech meetingu norma — respektuj to.
-    4. Zachovat speakera, identifikátory ([N]), formát řádku.
-    5. NESLUČOVAT, NEDĚLIT segmenty. Vrátíš přesně tolik řádků, kolik dostaneš.
-    6. Pokud je segment OK, vrať ho beze změny.
+    PRAVIDLO Č. 1 — REKONSTRUKCE FONETICKY DEFORMOVANÝCH SLOV:
+    Pokud slovo NENÍ reálné české (nebo anglické tech-term) slovo, je foneticky podobné nějakému \
+    skutečnému slovu, NEBO věta jako celek nedává smysl, REKONSTRUUJ správné slovo podle \
+    kontextu. Drž se zvukové podoby, ale výsledek musí být reálné slovo dávající smysl ve větě.
 
-    Odpověz POUZE opravenými řádky ve formátu vstupu, nic víc — žádné komentáře, vysvětlení \
-    ani markdown.
+    Příklady fonetických deformací (jen pro inspiraci, ne výčet):
+    „kacelař" → „kancelář" • „zratíž" → „ztratíš" • „v přípádi" → „v případě" • \
+    „udelame deploj" → „uděláme deploy" • „pouříví" → „používáš" • „kdyz" → „když" • \
+    „buť" → „buď" • „svům" → „svůj" • „odhlanit" → „odhlásit" • „rekvest" → „request" • \
+    „revjů" → „review" • „eskejp" → „escape"
+
+    DALŠÍ OPRAVY:
+    2. **Chybné koncovky** — rod, pád, číslo, shoda podmětu s přísudkem napříč větou.
+    3. **Diakritika a interpunkce** — doplň čárky v souvětích, oprav ú/ů, i/y, tečky.
+    4. **Vlastní jména a produkty** — kapitalizuj správně (Slack, GitHub, macOS, Figma, Postgres, \
+    Linear, Jira, Notion, Apple, Google).
+    5. **Halucinace Whisperu** — pokud je segment evidentně YouTube boilerplate („Děkuji za \
+    sledování", „Titulky vytvořil…", „nezapomeňte se přihlásit k odběru"), URL artefakt, \
+    nebo repetitivní smyčka stejného slova 3× a víc za sebou, nahraď text PRÁZDNÝM řetězcem \
+    za dvojtečkou.
+
+    CO ZACHOVEJ:
+    - Anglické technické termy beze změny: deploy, endpoint, API, pull request, repository, \
+    frontend, backend, commit, branch, merge, build, release, rollback. Code-switching CS/EN \
+    je norma — NEPŘEKLÁDEJ je do češtiny.
+    - Smysl a fakta. Nevymýšlej nový obsah, který v audio evidentně nezazněl. Pokud opravdu \
+    nevíš, co tam mělo být, nech segment beze změny.
+    - Identifikátor [N], jméno speakera, formát řádku.
+    - Přesný počet řádků. Žádné slučování ani dělení segmentů.
+
+    FORMÁT VÝSTUPU:
+    Jen opravené řádky, jeden segment = jeden řádek. Žádný úvod, žádné komentáře, žádný markdown, \
+    žádné backticks.
+
+    KOMPLEXNÍ PŘÍKLAD:
+
+    Vstup:
+    [1] David: pošlu ti to na slack a pak udelame deploj
+    [2] Lukáš: ten endpoint vraci 500 kdyz tam dam null
+    [3] Mariana: já bysem to spíš zkusila přes git rebase
+    [4] Petr: musíš odhlanit tu kacelař před tím než se to deplojne
+    [5] David: ne bo svoji firmu, nebo svůj kacelař
+    [6] Lukáš: stane vyměnil jenom tady jeden klíš
+    [7] Speaker: Děkuji za sledování, nezapomeňte se přihlásit k odběru
+
+    Výstup:
+    [1] David: pošlu ti to na Slack a pak uděláme deploy
+    [2] Lukáš: ten endpoint vrací 500, když tam dám null
+    [3] Mariana: já bych to spíš zkusila přes git rebase
+    [4] Petr: musíš odhlásit tu kancelář před tím, než se to deployne
+    [5] David: nebo svoji firmu, nebo svoji kancelář
+    [6] Lukáš: stačí vyměnit jenom tady tenhle klíč
+    [7] Speaker:
     """
 
     private func buildPrompt(
@@ -358,9 +428,11 @@ final class TranscriptRefiner {
         return lines.joined(separator: "\n")
     }
 
-    /// Parse the model's `[N] Speaker: text` response back into ordered texts. Returns an
-    /// empty array on any structural failure so the caller can fall back to originals.
-    private func parseResponse(_ response: String, expectedCount: Int) -> [String] {
+    /// Parse the model's `[N] Speaker: text` response back into ordered texts. Returns one slot
+    /// per expected segment: the new text if the line parsed cleanly, `nil` if that specific
+    /// line was malformed (caller keeps the original for that index — per-segment graceful
+    /// fallback so a single bad line doesn't void the whole chunk).
+    private func parseResponse(_ response: String, expectedCount: Int) -> [String?] {
         var slots: [String?] = Array(repeating: nil, count: expectedCount)
         for rawLine in response.split(whereSeparator: { $0.isNewline }) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
@@ -370,13 +442,14 @@ final class TranscriptRefiner {
             // Skip context-marker lines the model might echo back.
             guard inside != "ctx", let idx = Int(inside), idx >= 1, idx <= expectedCount else { continue }
 
-            // After ']' we expect " SPEAKER: text" — strip everything up to and including the first ':'.
+            // After ']' the format is " SPEAKER: text". Mistral Nemo occasionally types ']'
+            // instead of ':' (e.g. "[7] Speaker 1] nebo …") — accept either char as the
+            // speaker→text separator so one malformed line doesn't waste the whole chunk's work.
             let afterBracket = line[line.index(after: close)...].trimmingCharacters(in: .whitespaces)
-            guard let colon = afterBracket.firstIndex(of: ":") else { continue }
-            let text = afterBracket[afterBracket.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            guard let sep = afterBracket.firstIndex(where: { $0 == ":" || $0 == "]" }) else { continue }
+            let text = afterBracket[afterBracket.index(after: sep)...].trimmingCharacters(in: .whitespaces)
             slots[idx - 1] = text
         }
-        guard !slots.contains(where: { $0 == nil }) else { return [] }
-        return slots.compactMap { $0 }
+        return slots
     }
 }

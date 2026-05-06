@@ -28,7 +28,9 @@ struct RecordingDetailView: View {
             ProgressBanner(
                 status: recording.status,
                 detail: state.processingDetail,
-                onCancel: { state.cancelProcessing(for: recording) }
+                onCancel: { state.cancelProcessing(for: recording) },
+                isCancelling: state.cancellingIds.contains(recording.id),
+                dismissibleFailure: true
             )
             // Show the player whenever the cleaned WAV exists on disk — independent of the
             // transcript artifact. This lets the user preview the enhanced recording (HPF +
@@ -91,15 +93,18 @@ struct RecordingDetailView: View {
                 } label: {
                     Label("Vyčistit přepis", systemImage: "wand.and.stars")
                 }
-                .help("Lokální Mistral Nemo 12B model (in-app, MLX) projde přepis a opraví zjevné chyby rozpoznávání pomocí kontextu. Zachovává anglické technické termy. První spuštění stáhne ~7 GB.")
+                .help("Lokální Qwen 2.5 7B model (in-app, MLX) projde přepis a opraví zjevné chyby rozpoznávání pomocí kontextu. Zachovává anglické technické termy. První spuštění stáhne ~4 GB.")
                 .disabled(isProcessing)
             }
-            if artifact != nil {
+            if artifact != nil || FileManager.default.fileExists(atPath: recording.audioURL.path) {
                 Menu {
-                    Button("Export TXT") { exportTxt() }
-                    Button("Export JSON") { exportJson() }
-                    Button("Export audio (WAV)") { exportAudio() }
-                        .disabled(!FileManager.default.fileExists(atPath: recording.audioURL.path))
+                    if artifact != nil {
+                        Button("Export TXT") { exportTxt() }
+                        Button("Export JSON") { exportJson() }
+                    }
+                    if FileManager.default.fileExists(atPath: recording.audioURL.path) {
+                        Button("Export audio (WAV)") { exportAudio() }
+                    }
                 } label: {
                     Label("Export", systemImage: "square.and.arrow.up")
                 }

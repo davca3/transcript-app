@@ -16,7 +16,7 @@ final class AudioRecorder: ObservableObject {
     @Published private(set) var level: Float = 0
     @Published private(set) var isFinalizing = false  // true while mixing after stop
 
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var micFile: AVAudioFile?
     private var micURL: URL?
     private var startedAt: Date?
@@ -26,6 +26,11 @@ final class AudioRecorder: ObservableObject {
 
     func start(_ config: Config = Config()) throws {
         guard !isRecording else { throw RecorderError.alreadyRecording }
+
+        // Fresh engine per session: AVAudioEngine caches the input node's hardware
+        // format from the previous session, so reusing the instance after the user
+        // switches input device causes installTap to fail with a format mismatch.
+        engine = AVAudioEngine()
 
         // Switch input device if user picked a non-default one.
         if let uid = config.inputDeviceUID, let dev = AudioDeviceManager.device(forUID: uid) {

@@ -28,6 +28,11 @@ final class AppState: ObservableObject {
     /// survives until the next pass through the run loop.
     private var inflightTasks: [UUID: Task<Void, Never>] = [:]
 
+    /// Recordings whose Task has been .cancel()'d but hasn't yet unwound to a terminal status.
+    /// Drives the "Ruším…" spinner in `ProgressBanner` so the user gets feedback during the gap
+    /// between clicking Zrušit and the catch site flipping status to `.failed`.
+    @Published private(set) var cancellingIds: Set<UUID> = []
+
     init() {
         let transcriber = WhisperKitTranscriber()
         self.transcriber = transcriber
@@ -84,6 +89,7 @@ final class AppState: ObservableObject {
                 }
             }
             self.inflightTasks[id] = nil
+            self.cancellingIds.remove(id)
         }
         inflightTasks[id] = task
     }
@@ -94,6 +100,7 @@ final class AppState: ObservableObject {
             guard let self else { return }
             await self.pipeline.reprocess(recording) { _ in }
             self.inflightTasks[id] = nil
+            self.cancellingIds.remove(id)
         }
         inflightTasks[id] = task
     }
@@ -101,10 +108,12 @@ final class AppState: ObservableObject {
     /// Cancel whatever pipeline / refine task is currently running on this recording. No-op if
     /// nothing is running. The task body sees `Task.isCancelled` and updates the recording's
     /// status accordingly (.failed for pipeline mid-flight, reverts to .done for refine since
-    /// the original transcript is still intact).
+    /// the original transcript is still intact). The id is parked in `cancellingIds` so the UI
+    /// shows a spinner during the unwind window.
     func cancelProcessing(for recording: Recording) {
         if let task = inflightTasks[recording.id] {
             print("[AppState] cancelling in-flight task for \(recording.id)")
+            cancellingIds.insert(recording.id)
             task.cancel()
         }
     }
@@ -140,6 +149,7 @@ final class AppState: ObservableObject {
             // body returns, success or fail.
             defer {
                 self.inflightTasks[id] = nil
+                self.cancellingIds.remove(id)
                 self.processingDetail = nil
             }
 

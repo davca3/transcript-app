@@ -2,7 +2,8 @@ import Foundation
 
 /// Orchestrates: source audio → 48 kHz mono → cleanup (HPF + loudness) → store WAV →
 /// resample to 16 kHz → transcribe + diarize → embed → identify → persist.
-@MainActor
+/// Runs off the main actor so heavy CPU/IO (decode, resample, speech-trim) doesn't block
+/// the UI; only store mutations + progress callbacks hop to MainActor.
 final class PipelineCoordinator {
     private let transcriber: TranscriptionService
     private let diarizer: DiarizationService
@@ -36,7 +37,7 @@ final class PipelineCoordinator {
         sourceURL: URL,
         title: String,
         sourceKind: Recording.SourceKind,
-        progress: @escaping (Recording) -> Void
+        progress: @Sendable @escaping (Recording) -> Void
     ) async {
         var rec = Recording(
             id: id,
@@ -51,14 +52,14 @@ final class PipelineCoordinator {
         do {
             try Task.checkCancellation()
             rec.status = .running(stage: .decoding, progress: 0.05)
-            recordings.upsert(rec, persistImmediately: true); progress(rec)  // first insert → flush
+            await publish(rec, persistImmediately: true, progress: progress)  // first insert → flush
 
             // Load at 48 kHz so the on-disk WAV plays back fully-bandwidth.
             var samples48k = try AudioUtils.loadAndResample(from: sourceURL, sampleRate: AudioUtils.storedSampleRate)
             rec.duration = TimeInterval(samples48k.count) / AudioUtils.storedSampleRate
 
             rec.status = .running(stage: .enhancing, progress: 0.1)
-            recordings.upsert(rec); progress(rec)
+            await publish(rec, progress: progress)
             let cleanT0 = Date()
 
             // Stage 1: HPF on the shared buffer. Removes rumble that hurts both playback and
@@ -89,57 +90,61 @@ final class PipelineCoordinator {
             try AudioUtils.writeWav(samples: samples48k, to: rec.audioURL, sampleRate: AudioUtils.storedSampleRate)
 
             try Task.checkCancellation()
-            try await runStages(samples: pipelineSamples, rec: &rec, progress: progress)
+            try await runStages(samples: pipelineSamples, rec: rec, progress: progress)
         } catch is CancellationError {
             rec.status = .failed(message: "Zrušeno uživatelem")
-            recordings.upsert(rec, persistImmediately: true); progress(rec)
+            await publish(rec, persistImmediately: true, progress: progress)
             print("[Pipeline] process cancelled by user")
         } catch {
             rec.status = .failed(message: error.localizedDescription)
-            recordings.upsert(rec, persistImmediately: true); progress(rec)
+            await publish(rec, persistImmediately: true, progress: progress)
         }
     }
 
     /// Re-run transcription/diarization/identification on an existing recording's stored audio.
     /// Overwrites the prior transcript artifact. Speaker DB is unchanged.
     /// Skips cleanup — the stored WAV is already the cleaned version.
-    func reprocess(_ recording: Recording, progress: @escaping (Recording) -> Void) async {
+    func reprocess(_ recording: Recording, progress: @Sendable @escaping (Recording) -> Void) async {
         var rec = recording
         do {
             try Task.checkCancellation()
             rec.status = .running(stage: .decoding, progress: 0.05)
-            recordings.upsert(rec); progress(rec)
+            await publish(rec, progress: progress)
             let samples = try AudioUtils.loadAndResample(from: rec.audioURL)
             try Task.checkCancellation()
-            try await runStages(samples: samples, rec: &rec, progress: progress)
+            try await runStages(samples: samples, rec: rec, progress: progress)
         } catch is CancellationError {
             rec.status = .failed(message: "Zrušeno uživatelem")
-            recordings.upsert(rec, persistImmediately: true); progress(rec)
+            await publish(rec, persistImmediately: true, progress: progress)
             print("[Pipeline] reprocess cancelled by user")
         } catch {
             rec.status = .failed(message: error.localizedDescription)
-            recordings.upsert(rec, persistImmediately: true); progress(rec)
+            await publish(rec, persistImmediately: true, progress: progress)
         }
     }
 
-    /// Shared transcribe → diarize → identify → stitch → persist path. Mutates `rec.status`
-    /// through stages and reports each via the `progress` callback.
+    /// Shared transcribe → diarize → identify → stitch → persist path. Drives `rec.status`
+    /// through stages and reports each via the `progress` callback. Caller passes `rec` by
+    /// value — terminal status updates happen here, and any throw propagates without the
+    /// caller needing to see in-flight mutations (the catch sites overwrite to `.failed`).
     private func runStages(
         samples: [Float],
-        rec: inout Recording,
-        progress: @escaping (Recording) -> Void
+        rec recIn: Recording,
+        progress: @Sendable @escaping (Recording) -> Void
     ) async throws {
+        var rec = recIn
         rec.status = .running(stage: .transcribing, progress: 0.05)
-        recordings.upsert(rec); progress(rec)
+        await publish(rec, progress: progress)
 
-        // Trim silence for BOTH transcribe and diarize. Pyannote is the long pole — running
-        // it on trimmed audio cuts wall time roughly proportionally to silence ratio.
-        // Cluster turns come back in trimmed timeline; we translate them back to original.
-        let (trimmedSamples, translate) = AudioUtils.trimSilence(samples: samples)
+        // Trim non-speech (silence + music + applause) before transcribe + diarize. Pyannote is
+        // the long pole — running it on speech-only audio cuts wall time roughly proportionally
+        // to non-speech ratio. Cluster turns come back in trimmed timeline; `translate` maps
+        // them back to the original.
+        let (trimmedSamples, translate) = try await AudioUtils.trimToSpeech(samples: samples)
         let originalDur = TimeInterval(samples.count) / AudioUtils.targetSampleRate
         let trimmedDur = TimeInterval(trimmedSamples.count) / AudioUtils.targetSampleRate
         let savedPct = originalDur > 0 ? Int((originalDur - trimmedDur) / originalDur * 100) : 0
-        print(String(format: "[Pipeline] silence-trim: %.1fs → %.1fs (saved %d%%)",
+        print(String(format: "[Pipeline] speech-trim: %.1fs → %.1fs (saved %d%%)",
                      originalDur, trimmedDur, savedPct))
 
         // Estimate parallel wall time. On M1 Pro, observed (after chunked-parallel diarize):
@@ -172,6 +177,8 @@ final class PipelineCoordinator {
             }
         }
 
+        let transcriber = self.transcriber
+        let diarizer = self.diarizer
         async let transcriptTask: Transcript = transcriber.transcribe(samples: trimmedSamples, languageHint: nil)
         async let turnsTask: [SpeakerTurn] = diarizer.diarize(samples: trimmedSamples)
 
@@ -191,10 +198,12 @@ final class PipelineCoordinator {
         }
         progressTask.cancel()
         // Read back rec from the store (the timer may have updated it).
-        if let updated = store.recordings.first(where: { $0.id == recId }) { rec = updated }
+        if let updated = await MainActor.run(body: { store.recordings.first(where: { $0.id == recId }) }) {
+            rec = updated
+        }
 
         rec.status = .running(stage: .identifying, progress: 0.8)
-        recordings.upsert(rec); progress(rec)
+        await publish(rec, progress: progress)
 
         let rawClusterEmbeddings = try await computeClusterEmbeddings(turns: turns, samples: samples)
         // Auto-merge clusters that look like the same speaker (FluidAudio sometimes splits one
@@ -204,7 +213,8 @@ final class PipelineCoordinator {
             turns: turns,
             threshold: 0.70
         )
-        let assignments = identifier.assign(clusters: clusterEmbeddings)
+        let identifier = self.identifier
+        let assignments = await MainActor.run { identifier.assign(clusters: clusterEmbeddings) }
         let (stitched, usedClusterIds) = stitch(transcript: transcript, turns: mergedTurns, assignments: assignments)
         // Drop "ghost" clusters that no segment ended up referencing (diarizer found a turn the
         // transcript never overlapped) — otherwise they appear as orphan chips with no text.
@@ -213,10 +223,26 @@ final class PipelineCoordinator {
         let stored = storedAssignments(from: liveAssignments, clusterEmbeddings: liveEmbeddings)
 
         let artifact = RecordingArtifact(transcript: stitched, clusterAssignments: stored)
-        recordings.saveArtifact(artifact, for: rec)
+        let recForArtifact = rec
+        await MainActor.run { store.saveArtifact(artifact, for: recForArtifact) }
 
         rec.status = .done
-        recordings.upsert(rec, persistImmediately: true); progress(rec)  // terminal → flush
+        await publish(rec, persistImmediately: true, progress: progress)  // terminal → flush
+    }
+
+    /// Hop to MainActor to upsert the recording into the store and notify the caller. Used at
+    /// every status flip so the UI re-renders. Heavy work runs on the global executor — this
+    /// hop is the only main-thread touch per stage.
+    private func publish(
+        _ rec: Recording,
+        persistImmediately: Bool = false,
+        progress: @Sendable @escaping (Recording) -> Void
+    ) async {
+        let store = recordings
+        await MainActor.run {
+            store.upsert(rec, persistImmediately: persistImmediately)
+            progress(rec)
+        }
     }
 
     // MARK: - Cluster embeddings

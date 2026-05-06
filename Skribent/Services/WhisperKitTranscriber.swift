@@ -23,9 +23,15 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
     /// users can opt in via `Settings → Akcelerace přepisu`.
     static let useANEDefaultsKey = "useAppleNeuralEngine"
 
-    /// Default: Whisper Turbo (`large-v3` distilled). ~5–8× faster than full large-v3 with
-    /// near-equivalent cs/en quality. Roughly 600 MB download on first run.
-    init(modelName: String = "openai_whisper-large-v3-v20240930_turbo") {
+    /// Default: full `large-v3`. Picked over the distilled `_turbo` variant because turbo's
+    /// quality drop on Czech (especially deformed phonemes, fast/overlapping speech, and rare
+    /// vocabulary) showed up as gibberish words the refiner couldn't recover ("Vynáhle",
+    /// "zároveŽá"). Full v3 is ~3-5× slower but markedly better at acoustic edge cases.
+    /// ~1.5 GB download on first run; ~10× realtime on M-series Macs.
+    /// To swap to faster/smaller variants:
+    ///   - `openai_whisper-large-v3-v20240930_turbo` (~600 MB, ~50× realtime, weaker on hard CS audio)
+    ///   - `openai_whisper-base` (~150 MB, very fast, much weaker quality)
+    init(modelName: String = "openai_whisper-large-v3-v20240930") {
         self.modelName = modelName
     }
 

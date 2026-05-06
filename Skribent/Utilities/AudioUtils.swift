@@ -1,5 +1,6 @@
 import AVFoundation
 import Accelerate
+import SoundAnalysis
 
 enum AudioUtils {
     static let targetSampleRate: Double = 16_000
@@ -348,6 +349,190 @@ enum AudioUtils {
             return result
         }
         return (trimmed, translate)
+    }
+
+    // MARK: - ML-based speech detection (drops silence AND music)
+
+    /// Apple SoundAnalysis-based speech detector. Unlike the energy-based `detectSpeech`,
+    /// this distinguishes speech from music, applause, and other ambient labels — so intro
+    /// jingles between turns get trimmed too. Returns regions in the original timeline.
+    static func detectSpeechClassified(
+        samples: [Float],
+        sampleRate: Double = targetSampleRate,
+        minSpeechSec: Double = 0.4,
+        minSilenceSec: Double = 0.6,
+        paddingSec: Double = 0.2,
+        speechConfidenceMin: Double = 0.6
+    ) async throws -> [(start: TimeInterval, end: TimeInterval)] {
+        guard !samples.isEmpty else { return [] }
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else { throw AudioError.formatUnavailable }
+
+        let analyzer = SNAudioStreamAnalyzer(format: format)
+        let request = try SNClassifySoundRequest(classifierIdentifier: .version1)
+        let observer = SpeechClassifierObserver()
+        try analyzer.add(request, withObserver: observer)
+
+        // Push samples in 1-second chunks. SNAudioStreamAnalyzer requires serial analyze() calls.
+        let chunkFrames = Int(sampleRate)
+        var pos: AVAudioFramePosition = 0
+        var idx = 0
+        while idx < samples.count {
+            let end = Swift.min(samples.count, idx + chunkFrames)
+            let count = end - idx
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)) else {
+                throw AudioError.bufferAllocFailed
+            }
+            buffer.frameLength = AVAudioFrameCount(count)
+            samples.withUnsafeBufferPointer { src in
+                if let dst = buffer.floatChannelData?[0], let base = src.baseAddress {
+                    memcpy(dst, base.advanced(by: idx), count * MemoryLayout<Float>.size)
+                }
+            }
+            analyzer.analyze(buffer, atAudioFramePosition: pos)
+            pos += AVAudioFramePosition(count)
+            idx = end
+        }
+        analyzer.completeAnalysis()
+        let windows = await observer.finished()
+
+        return mergeSpeechWindows(
+            windows: windows,
+            totalEndSec: TimeInterval(samples.count) / sampleRate,
+            minSpeechSec: minSpeechSec,
+            minSilenceSec: minSilenceSec,
+            paddingSec: paddingSec,
+            confidenceMin: speechConfidenceMin
+        )
+    }
+
+    /// Same shape as `trimSilence`, but uses the SoundAnalysis classifier — drops both silence
+    /// AND non-speech audio (music between turns, applause, etc.). The returned `translate`
+    /// maps trimmed-timeline offsets back to the original timeline, so transcript and diarize
+    /// timestamps line up with the on-disk recording.
+    static func trimToSpeech(
+        samples: [Float]
+    ) async throws -> (trimmed: [Float], translate: (TimeInterval) -> TimeInterval) {
+        let regions = try await detectSpeechClassified(samples: samples)
+        guard !regions.isEmpty else { return (samples, { $0 }) }
+
+        var trimmed: [Float] = []
+        trimmed.reserveCapacity(samples.count)
+        var offsets: [(trimStart: TimeInterval, origStart: TimeInterval)] = []
+        for r in regions {
+            let trimStart = TimeInterval(trimmed.count) / targetSampleRate
+            let lo = Swift.max(0, Int(r.start * targetSampleRate))
+            let hi = Swift.min(samples.count, Int(r.end * targetSampleRate))
+            guard lo < hi else { continue }
+            trimmed.append(contentsOf: samples[lo..<hi])
+            offsets.append((trimStart, r.start))
+        }
+
+        let translate: (TimeInterval) -> TimeInterval = { t in
+            var result = t
+            for entry in offsets {
+                if t >= entry.trimStart {
+                    result = entry.origStart + (t - entry.trimStart)
+                } else {
+                    break
+                }
+            }
+            return result
+        }
+        return (trimmed, translate)
+    }
+
+    private static func mergeSpeechWindows(
+        windows: [(start: TimeInterval, end: TimeInterval, speechConfidence: Double)],
+        totalEndSec: TimeInterval,
+        minSpeechSec: Double,
+        minSilenceSec: Double,
+        paddingSec: Double,
+        confidenceMin: Double
+    ) -> [(start: TimeInterval, end: TimeInterval)] {
+        // Default windowDuration is 0.975s, default overlapFactor is 0.5 → adjacent speech
+        // windows overlap. Union-merge is the simplest correct way to collapse them.
+        let speech = windows
+            .filter { $0.speechConfidence >= confidenceMin }
+            .map { (start: $0.start, end: $0.end) }
+            .sorted { $0.start < $1.start }
+        guard !speech.isEmpty else { return [] }
+
+        var regions: [(start: TimeInterval, end: TimeInterval)] = [speech[0]]
+        for w in speech.dropFirst() {
+            let gap = w.start - regions[regions.count - 1].end
+            if gap <= minSilenceSec {
+                regions[regions.count - 1].end = Swift.max(regions[regions.count - 1].end, w.end)
+            } else {
+                regions.append(w)
+            }
+        }
+        regions = regions.filter { $0.end - $0.start >= minSpeechSec }
+
+        var padded: [(start: TimeInterval, end: TimeInterval)] = []
+        for r in regions {
+            let s = Swift.max(0, r.start - paddingSec)
+            let e = Swift.min(totalEndSec, r.end + paddingSec)
+            if !padded.isEmpty, s <= padded[padded.count - 1].end {
+                padded[padded.count - 1].end = e
+            } else {
+                padded.append((s, e))
+            }
+        }
+        return padded
+    }
+}
+
+/// Bridges `SNResultsObserving` callbacks into an async-await result. The observer can reach
+/// `requestDidComplete` before the consumer awaits `finished()`, so we latch the result and
+/// only park a continuation when one is supplied before completion.
+private final class SpeechClassifierObserver: NSObject, SNResultsObserving, @unchecked Sendable {
+    typealias Window = (start: TimeInterval, end: TimeInterval, speechConfidence: Double)
+
+    private var windows: [Window] = []
+    private var continuation: CheckedContinuation<[Window], Never>?
+    private var completed = false
+    private let lock = NSLock()
+
+    func finished() async -> [Window] {
+        await withCheckedContinuation { cont in
+            lock.lock()
+            if completed {
+                let result = windows
+                lock.unlock()
+                cont.resume(returning: result)
+            } else {
+                continuation = cont
+                lock.unlock()
+            }
+        }
+    }
+
+    func request(_ request: SNRequest, didProduce result: SNResult) {
+        guard let classification = result as? SNClassificationResult else { return }
+        let speech = classification.classification(forIdentifier: "speech")?.confidence ?? 0
+        let start = classification.timeRange.start.seconds
+        let end = classification.timeRange.end.seconds
+        lock.lock()
+        windows.append((start, end, Double(speech)))
+        lock.unlock()
+    }
+
+    func request(_ request: SNRequest, didFailWithError error: Error) { finishUp() }
+    func requestDidComplete(_ request: SNRequest) { finishUp() }
+
+    private func finishUp() {
+        lock.lock()
+        completed = true
+        let cont = continuation
+        let result = windows
+        continuation = nil
+        lock.unlock()
+        cont?.resume(returning: result)
     }
 }
 

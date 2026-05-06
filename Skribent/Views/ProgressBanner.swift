@@ -9,6 +9,17 @@ struct ProgressBanner: View {
     /// "Zrušit" button that calls this closure. The actual task cancellation is handled by
     /// the caller (typically `AppState.cancelProcessing(for:)`).
     var onCancel: (() -> Void)? = nil
+    /// True between the moment the user clicks "Zrušit" and the task actually unwinding to a
+    /// terminal status. Swaps the cancel button for a small spinner + "Ruším…" so the user
+    /// sees the click was registered even when cancellation takes a few seconds (e.g. waiting
+    /// for the next `Task.checkCancellation()` checkpoint inside Whisper / pyannote).
+    var isCancelling: Bool = false
+    /// When true, the failed-status banner shows an X button that hides it for the rest of
+    /// the view's lifetime in this status. Reset automatically whenever `status` changes (so
+    /// a fresh failure after a re-run shows again).
+    var dismissibleFailure: Bool = false
+
+    @State private var failureDismissed: Bool = false
 
     /// Reset point: when status flips into .running we capture Date.now and use it for
     /// elapsed/ETA derivation. We also track the previous progress so jumping backwards
@@ -38,16 +49,36 @@ struct ProgressBanner: View {
                     detail: detail
                 )
             case .failed(let msg):
-                HStack(spacing: 10) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-                    Text(msg).font(.caption)
-                    Spacer()
+                if dismissibleFailure && failureDismissed {
+                    EmptyView()
+                } else {
+                    HStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                        Text(msg).font(.caption)
+                        Spacer()
+                        if dismissibleFailure {
+                            Button {
+                                failureDismissed = true
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundStyle(.secondary)
+                            .help("Skrýt upozornění")
+                        }
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                    .background(Color.red.opacity(0.08))
                 }
-                .padding(.horizontal, 16).padding(.vertical, 8)
-                .background(Color.red.opacity(0.08))
             case .done:
                 EmptyView()
             }
+        }
+        .onChange(of: status) {
+            // A status flip (re-run, success, fresh failure) re-arms the dismiss button so the
+            // user always sees the latest state.
+            failureDismissed = false
         }
         .onChange(of: isRunningOrPending) { _, running in
             if running, startedAt == nil { startedAt = Date() }
@@ -89,11 +120,21 @@ struct ProgressBanner: View {
                             .foregroundStyle(.secondary)
                     }
                     if let onCancel {
-                        Button("Zrušit", action: onCancel)
-                            .buttonStyle(.borderless)
+                        if isCancelling {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Text("Ruším…").font(.caption).foregroundStyle(.secondary)
+                            }
+                            .transition(.opacity)
+                        } else {
+                            Button(action: onCancel) {
+                                Text("Zrušit")
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.red)
                             .controlSize(.small)
-                            .foregroundStyle(.red)
                             .help("Zrušit probíhající operaci. Audio a stávající přepis zůstanou nedotčené.")
+                        }
                     }
                 }
                 if indeterminate {
@@ -135,16 +176,19 @@ struct ProgressBanner: View {
     }
 
     private func stageLabel(_ stage: Recording.ProcessingStatus.Stage) -> String {
+        let base: String
         switch stage {
-        case .decoding: return "Dekóduji audio…"
-        case .enhancing: return "Vylepšuji zvuk…"
-        case .transcribing: return "Přepisuji řeč (Whisper)…"
-        case .diarizing: return "Rozděluji mluvčí (pyannote)…"
-        case .identifying: return "Rozpoznávám známé hlasy…"
-        case .downloadingModel: return "Stahuji Mistral Nemo (~7 GB, jednorázově)…"
-        case .loadingModel: return "Načítám Mistral Nemo do paměti…"
-        case .refining: return "Vylepšuji přepis (Mistral Nemo)…"
+        case .decoding: base = "Dekóduji audio…"
+        case .enhancing: base = "Vylepšuji zvuk…"
+        case .transcribing: base = "Přepisuji řeč (Whisper)…"
+        case .diarizing: base = "Rozděluji mluvčí (pyannote)…"
+        case .identifying: base = "Rozpoznávám známé hlasy…"
+        case .downloadingModel: base = "Stahuji Qwen 2.5 (~4 GB, jednorázově)…"
+        case .loadingModel: base = "Načítám Qwen 2.5 do paměti…"
+        case .refining: base = "Vylepšuji přepis (Qwen 2.5)…"
         }
+        let s = stage.step
+        return "Krok \(s.current) z \(s.total) · \(base)"
     }
 
     /// Linear extrapolation: ETA = elapsed × (1/progress − 1). Only meaningful once progress
@@ -160,5 +204,25 @@ struct ProgressBanner: View {
         if t < 60 { return String(format: "%d s", Int(t.rounded())) }
         let m = Int(t) / 60, s = Int(t) % 60
         return String(format: "%d:%02d min", m, s)
+    }
+}
+
+private extension Recording.ProcessingStatus.Stage {
+    /// Position of this stage within its pipeline so the banner can show "Krok N z M".
+    /// Process pipeline = 4 steps (transcribe + diarize fold into one — they run in parallel).
+    /// Refine pipeline = 3 steps (download is conditionally skipped on warm cache; if it is,
+    /// the user briefly sees "2 z 3" instead of "1 z 2" — acceptable since the actual ordering
+    /// inside refine is unambiguous from the label).
+    var step: (current: Int, total: Int) {
+        switch self {
+        case .decoding:         return (1, 4)
+        case .enhancing:        return (2, 4)
+        case .transcribing:     return (3, 4)
+        case .diarizing:        return (3, 4)
+        case .identifying:      return (4, 4)
+        case .downloadingModel: return (1, 3)
+        case .loadingModel:     return (2, 3)
+        case .refining:         return (3, 3)
+        }
     }
 }
