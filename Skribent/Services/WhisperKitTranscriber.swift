@@ -176,13 +176,13 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
         return Transcript(segments: segments, detectedLanguage: language)
     }
 
-    /// Strip Whisper special tokens like `<|startoftranscript|>` and trim.
-    /// `skipSpecialTokens: true` should already do this; this is a defensive belt+suspenders.
-    // Safe: literal pattern, NSRegularExpression compile cannot throw at runtime.
-    private static let specialTokenRegex = try! NSRegularExpression(pattern: #"<\|[^|]*\|>"#)
+    /// Strip Whisper special tokens like `<|startoftranscript|>` and trim. `skipSpecialTokens:
+    /// true` in DecodingOptions should already do this; this is a defensive belt+suspenders.
+    /// Uses Swift's native Regex literal so the compiler validates the pattern at build time —
+    /// no runtime `try!` and no NSRegularExpression-string round-trip.
+    private static let specialTokenRegex = #/<\|[^|]*\|>/#
     private static func cleanText(_ text: String) -> String {
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        let stripped = specialTokenRegex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
+        let stripped = text.replacing(specialTokenRegex, with: "")
         return stripped.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
     }
 

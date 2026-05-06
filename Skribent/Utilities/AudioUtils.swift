@@ -1,5 +1,6 @@
 import AVFoundation
 import Accelerate
+import os
 import SoundAnalysis
 
 enum AudioUtils {
@@ -490,25 +491,28 @@ enum AudioUtils {
 /// Bridges `SNResultsObserving` callbacks into an async-await result. The observer can reach
 /// `requestDidComplete` before the consumer awaits `finished()`, so we latch the result and
 /// only park a continuation when one is supplied before completion.
+///
+/// Stays `@unchecked Sendable`: `SNResultsObserving` is an ObjC delegate protocol that requires
+/// `NSObject`, which can't be an `actor`. The shared state lives behind a single
+/// `OSAllocatedUnfairLock` so concurrency invariants are still expressible at the type level.
 private final class SpeechClassifierObserver: NSObject, SNResultsObserving, @unchecked Sendable {
     typealias Window = (start: TimeInterval, end: TimeInterval, speechConfidence: Double)
 
-    private var windows: [Window] = []
-    private var continuation: CheckedContinuation<[Window], Never>?
-    private var completed = false
-    private let lock = NSLock()
+    private struct State {
+        var windows: [Window] = []
+        var continuation: CheckedContinuation<[Window], Never>?
+        var completed = false
+    }
+    private let state = OSAllocatedUnfairLock<State>(initialState: State())
 
     func finished() async -> [Window] {
         await withCheckedContinuation { cont in
-            lock.lock()
-            if completed {
-                let result = windows
-                lock.unlock()
-                cont.resume(returning: result)
-            } else {
-                continuation = cont
-                lock.unlock()
+            let immediate: [Window]? = state.withLock { s in
+                if s.completed { return s.windows }
+                s.continuation = cont
+                return nil
             }
+            if let immediate { cont.resume(returning: immediate) }
         }
     }
 
@@ -517,22 +521,20 @@ private final class SpeechClassifierObserver: NSObject, SNResultsObserving, @unc
         let speech = classification.classification(forIdentifier: "speech")?.confidence ?? 0
         let start = classification.timeRange.start.seconds
         let end = classification.timeRange.end.seconds
-        lock.lock()
-        windows.append((start, end, Double(speech)))
-        lock.unlock()
+        state.withLock { $0.windows.append((start, end, Double(speech))) }
     }
 
     func request(_ request: SNRequest, didFailWithError error: Error) { finishUp() }
     func requestDidComplete(_ request: SNRequest) { finishUp() }
 
     private func finishUp() {
-        lock.lock()
-        completed = true
-        let cont = continuation
-        let result = windows
-        continuation = nil
-        lock.unlock()
-        cont?.resume(returning: result)
+        let pending: (CheckedContinuation<[Window], Never>, [Window])? = state.withLock { s in
+            s.completed = true
+            guard let cont = s.continuation else { return nil }
+            s.continuation = nil
+            return (cont, s.windows)
+        }
+        pending?.0.resume(returning: pending!.1)
     }
 }
 

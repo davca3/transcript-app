@@ -5,9 +5,31 @@ import Combine
 /// Cluster IDs are typed as `Int`; JSON serializes them as string-shaped keys (Foundation's
 /// default for `[Int: V]`) so older artifacts that wrote `[String: StoredAssignment]` still
 /// decode unchanged — same on-disk shape, stronger in-memory typing.
+///
+/// Schema-evolution policy: additive-only. New fields must be `Optional` or have a sensible
+/// default (via custom `init(from:)`) so old artifacts on disk keep loading after an upgrade.
+/// Renaming or retyping a field is a breaking change and needs a one-shot migration in `load()`.
 struct RecordingArtifact: Codable, Hashable {
     var transcript: Transcript
     var clusterAssignments: [Int: StoredAssignment]
+
+    init(transcript: Transcript, clusterAssignments: [Int: StoredAssignment]) {
+        self.transcript = transcript
+        self.clusterAssignments = clusterAssignments
+    }
+
+    /// Tolerant decode: missing `clusterAssignments` defaults to empty so an artifact written
+    /// by a future build that drops the field (or by a partial write) still loads — the user
+    /// sees segments without speaker chips instead of a blank failure banner.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.transcript = try c.decode(Transcript.self, forKey: .transcript)
+        self.clusterAssignments = (try? c.decodeIfPresent([Int: StoredAssignment].self, forKey: .clusterAssignments)) ?? [:]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case transcript, clusterAssignments
+    }
 
     func assignment(for clusterId: Int) -> StoredAssignment? { clusterAssignments[clusterId] }
     mutating func setAssignment(_ a: StoredAssignment, for clusterId: Int) { clusterAssignments[clusterId] = a }

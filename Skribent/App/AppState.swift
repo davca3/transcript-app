@@ -116,6 +116,16 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Kick off the full process pipeline on a freshly captured (or imported) audio file.
+    /// Inserts a `.pending` recording into the store immediately so the sidebar lights up,
+    /// then runs decode → cleanup → transcribe + diarize → identify → persist on a background
+    /// task. The task is registered in `inflightTasks` so the user's "Zrušit" button can stop it.
+    /// - Parameters:
+    ///   - sourceURL: Path to the captured/imported audio. May be any format `AVAudioFile` can
+    ///     decode (CAF / WAV / MP3 / M4A …); the pipeline normalizes to 48 kHz mono.
+    ///   - title: User-facing display name. Free text, can be empty.
+    ///   - kind: `.microphone` for live captures, `.imported` for file-system drops. Drives
+    ///     the sidebar row icon and is preserved for export metadata.
     func processNewRecording(sourceURL: URL, title: String, kind: Recording.SourceKind) {
         // Pre-generate the recording id so we can register the task BEFORE the recording is
         // upserted into the store. Otherwise the user could click Cancel between recording
@@ -134,6 +144,10 @@ final class AppState: ObservableObject {
         inflightTasks[id] = task
     }
 
+    /// Re-run transcribe + diarize + identify against the recording's stored 16 kHz WAV (no
+    /// re-decode / re-cleanup — the WAV on disk is already the cleaned version). Overwrites the
+    /// existing artifact. Speaker DB is unaffected. Use this after the user names speakers in
+    /// the DB and wants the model's choices to flow back into a previously-processed recording.
     func regenerateTranscript(for recording: Recording) {
         let id = recording.id
         let task = Task { @MainActor [weak self] in
