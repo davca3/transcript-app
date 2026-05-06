@@ -40,7 +40,7 @@ struct RecordingDetailHeader: View {
                 Button(action: onRefine) {
                     Label("Vyčistit přepis", systemImage: "wand.and.stars")
                 }
-                .help("Lokální Qwen 2.5 7B model (in-app, MLX) projde přepis a opraví zjevné chyby rozpoznávání pomocí kontextu. Zachovává anglické technické termy. První spuštění stáhne ~4 GB.")
+                .help("Lokální Qwen 3.5 9B model (in-app, MLX) projde přepis a opraví zjevné chyby rozpoznávání pomocí kontextu. Zachovává anglické technické termy. První spuštění stáhne ~6 GB.")
                 .disabled(isProcessing)
             }
             if hasArtifact || hasAudio {

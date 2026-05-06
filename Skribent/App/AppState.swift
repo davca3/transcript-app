@@ -226,14 +226,14 @@ final class AppState: ObservableObject {
         return "\(formatter.string(fromByteCount: completed)) z \(formatter.string(fromByteCount: total))"
     }
 
-    /// LLM-assisted cleanup of an existing transcript via a local Qwen 2.5 7B model running
+    /// LLM-assisted cleanup of an existing transcript via a local Qwen 3.5 9B model running
     /// in-process via MLX. Only updates the `text` field of each segment — timestamps + speaker
     /// assignments + cluster embeddings are untouched. Replaces the artifact in place; no backup
     /// of the raw transcript is kept (per user preference: just keep the refined output, no toggle).
-    /// Apple Intelligence was the original choice but doesn't yet support Czech; Qwen 2.5 / 3
+    /// Apple Intelligence was the original choice but doesn't yet support Czech; Qwen 3.5
     /// has solid CS support.
     ///
-    /// First invocation triggers a one-time ~4.3 GB download of the model weights — banner
+    /// First invocation triggers a one-time ~6 GB download of the model weights — banner
     /// labels show the phase (.downloadingModel → .loadingModel → .refining). Cancel via
     /// `cancelProcessing(for:)`; on cancel the original transcript is preserved untouched.
     /// Pre-condition: recording must already have a persisted artifact (i.e. status `.done`).
@@ -243,9 +243,11 @@ final class AppState: ObservableObject {
             guard let self,
                   let initialRec = self.recordings.recordings.first(where: { $0.id == id }),
                   var artifact = self.recordings.loadArtifact(for: recording) else { return }
-            // Auto-cleanup: clear the inflight slot + transient detail string when this task
-            // body returns, success or fail.
+            let refiner = TranscriptRefiner()
+            // Auto-cleanup: unload Qwen from memory and clear the inflight slot + transient
+            // detail string when this task body returns, success, failure, or cancel.
             defer {
+                refiner.unloadModelFromMemory()
                 self.inflightTasks[id] = nil
                 self.cancellingIds.remove(id)
                 self.processingDetail = nil
@@ -272,7 +274,6 @@ final class AppState: ObservableObject {
             rec.status = .running(stage: .refining, progress: 0.0)
             recordings.upsert(rec, persistImmediately: true)
 
-            let refiner = TranscriptRefiner()
             let recId = recording.id
             do {
                 let refined = try await refiner.refine(

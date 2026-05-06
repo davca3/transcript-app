@@ -183,9 +183,9 @@ struct ProgressBanner: View {
         case .transcribing: base = "Přepisuji řeč (Whisper)…"
         case .diarizing: base = "Rozděluji mluvčí (pyannote)…"
         case .identifying: base = "Rozpoznávám známé hlasy…"
-        case .downloadingModel: base = "Stahuji Qwen 2.5 (~4 GB, jednorázově)…"
-        case .loadingModel: base = "Načítám Qwen 2.5 do paměti…"
-        case .refining: base = "Vylepšuji přepis (Qwen 2.5)…"
+        case .downloadingModel: base = "Stahuji Qwen 3.5 9B (~6 GB, jednorázově)…"
+        case .loadingModel: base = "Načítám Qwen 3.5 9B do paměti…"
+        case .refining: base = "Vylepšuji přepis (Qwen 3.5 9B)…"
         }
         let s = stage.step
         return "Krok \(s.current) z \(s.total) · \(base)"

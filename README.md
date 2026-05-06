@@ -4,7 +4,7 @@ Lokální macOS aplikace pro přepis nahrávek (cs/en) s automatickou diarizací
 
 - **ASR:** [WhisperKit](https://github.com/argmaxinc/WhisperKit) (Whisper large-v3 na Core ML)
 - **Diarizace + speaker embedding:** [FluidAudio](https://github.com/FluidInference/FluidAudio) (pyannote na Core ML, native Swift)
-- **LLM cleanup:** [MLX Swift](https://github.com/ml-explore/mlx-swift-lm) s lokálním Qwen 2.5 7B
+- **LLM cleanup:** [MLX Swift](https://github.com/ml-explore/mlx-swift-lm) s lokálním Qwen 3.5 9B
 - **UI:** SwiftUI, Apple Silicon, macOS deployment target nastaven v `project.yml`
 
 Vše běží lokálně. Žádná data neopouštějí Mac.
@@ -31,7 +31,7 @@ open Skribent.xcodeproj
 V Xcode pak ⌘R. **Při prvním spuštění** se na pozadí stáhnou modely:
 - WhisperKit large-v3 (~1.5 GB)
 - FluidAudio pyannote diarizace (~50 MB)
-- Qwen 2.5 7B 4-bit (~4.3 GB) — stáhne se až při prvním kliknutí na **Vyčistit přepis**
+- Qwen 3.5 9B OptiQ 4-bit (~6 GB) — stáhne se až při prvním kliknutí na **Vyčistit přepis**
 
 Banner v okně ukazuje průběh stahování.
 
@@ -61,7 +61,7 @@ Test target `SkribentTests` pokrývá `Cosine`, `Clustering`, `SpeakerIdentifier
 2. Pipeline projde fáze: **decode → enhance → transcribe + diarize (paralelně) → identify**. Indikátor postupu je nahoře v detailu.
 3. V **detailu nahrávky** vidíš přepis se segmenty per mluvčí. Klik na timestamp přehraje danou pasáž.
 4. Klik na **chip mluvčího** (Speaker 1, Speaker 2, …) → přejmenuj. Embeddingy se uloží do `~/Library/Application Support/Skribent/speakers.json`. Příští nahrávka rozpozná stejnou osobu automaticky.
-5. **Vyčistit přepis** — pustí lokální Qwen 2.5 nad přepisem a opraví zjevné chyby rozpoznávání.
+5. **Vyčistit přepis** — pustí lokální Qwen 3.5 nad přepisem a opraví zjevné chyby rozpoznávání.
 6. **Export** TXT / JSON / WAV přes tlačítko v detailu.
 
 ## Datové úložiště
@@ -111,7 +111,7 @@ Aplikace loguje přes `os.Logger` se subsystémem `com.skribent.app` a kategorie
 
 - WhisperKit při prvním spuštění **stahuje model** ze sítě (~1.5 GB). Pak vše offline.
 - Diarizace pyannote má v dlouhých tichých pasážích občasné split/merge chyby — manuální merge mluvčích je v UI (kliknutí na chip → vybrat existujícího mluvčího).
-- LLM cleanup (Qwen 2.5) má jednorázový download ~4.3 GB. Přeskočitelné, dokud uživatel neklikne **Vyčistit přepis**.
+- LLM cleanup (Qwen 3.5 9B) má jednorázový download ~6 GB. Přeskočitelné, dokud uživatel neklikne **Vyčistit přepis**.
 - Aplikace je v sandboxu — soubory mimo aplikační podporu otevírej přes file picker.
 
 ## Licence

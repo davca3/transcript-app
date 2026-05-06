@@ -5,12 +5,13 @@ import os
 // modules (HubClient, AutoTokenizer), so without these imports the expansion fails.
 import Hub
 import HuggingFace
+import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
 import Tokenizers
 
-/// Post-processing pass over a Whisper transcript: feeds chunks of segments to a local Qwen 3
+/// Post-processing pass over a Whisper transcript: feeds chunks of segments to a local Qwen 3.5
 /// model running in-process via MLX, and asks it to fix obvious recognition errors using the
 /// surrounding context. Timestamps and speaker assignments are preserved exactly — only
 /// `TranscriptSegment.text` is rewritten.
@@ -20,41 +21,43 @@ import Tokenizers
 ///
 /// Setup is one-time:
 /// 1. Dev machine needs Metal Toolchain: `sudo xcodebuild -downloadComponent MetalToolchain`
-/// 2. First refine click triggers the model download to `Documents/huggingface/...` (~5 GB).
+/// 2. First refine click triggers the model download to `Library/Caches/huggingface/...` (~6 GB).
 @MainActor
 final class TranscriptRefiner {
 
-    /// Qwen 2.5 7B Instruct 4-bit MLX. Picked over Mistral Nemo 12B 4-bit because Mistral at
-    /// 4-bit quantization was deterministically greedy ("copy input verbatim") — needed temp 0.5
-    /// to break out, which then introduced spurious changes ("tuhle" → "touhle"). Qwen 2.5 has
-    /// stronger instruction following at the same parameter scale and follows the few-shot prompt
-    /// reliably even at temp 0.3. Trade-off vs. Mistral: marginally weaker on EN code-switching
-    /// preservation, mitigated by explicit list in system prompt. ~4.3 GB on disk, ~4 GB RAM,
-    /// ~50 tokens/sec on M-series.
-    /// Other options if quality/speed needs to shift:
-    ///   - `mlx-community/Qwen2.5-14B-Instruct-4bit` (~8 GB, ~25 tok/s, better hard-case recovery)
-    ///   - `mlx-community/Qwen2.5-3B-Instruct-4bit` (~2 GB, ~80 tok/s, fastest, weaker reconstruction)
-    static let modelRepoId = "mlx-community/Qwen2.5-7B-Instruct-4bit"
+    /// Qwen 3.5 9B OptiQ 4-bit MLX. This is the text-generation MLX checkpoint that works with
+    /// the normal `MLXLLM` loader (`model_type = qwen3_5`), unlike the similarly named VLM
+    /// conversions that require `mlx-vlm`. The mixed 4/8-bit OptiQ weights are a reasonable
+    /// quality/RAM trade-off for an M1 Pro with 16 GB RAM: ~6 GB on disk, more correction
+    /// headroom than the prior 7B model, while leaving space for a few thousand tokens of KV
+    /// cache during longer transcript chunks.
+    static let modelRepoId = "mlx-community/Qwen3.5-9B-OptiQ-4bit"
     static let modelConfiguration = ModelConfiguration(id: modelRepoId)
 
     /// Estimated total download size for the configured model. Used as denominator for the
     /// disk-poll progress when HubClient hasn't yet reported `totalUnitCount` (it only fires
-    /// after listing the repo, which can take a few seconds). For Qwen 2.5 7B 4-bit MLX the
-    /// repo is ~4.3 GB; if you swap models, update this estimate so the bar isn't off.
-    private nonisolated static let estimatedTotalBytes: Int64 = 4_500_000_000
+    /// after listing the repo, which can take a few seconds). For Qwen 3.5 9B OptiQ 4-bit MLX
+    /// the repo is ~6.0 GB; if you swap models, update this estimate so the bar isn't off.
+    private nonisolated static let estimatedTotalBytes: Int64 = 6_100_000_000
 
 
     /// Number of segments per LLM call. Balances cross-sentence context vs. per-call latency
-    /// and token budget. 15 ≈ 2–3 minutes of meeting speech.
-    static let chunkSize = 15
+    /// and token budget. 30 roughly halves per-call overhead vs. the previous 15 while staying
+    /// conservative for a 9B model on 16 GB unified memory.
+    static let chunkSize = 30
 
-    /// Read-only context segments included from the previous chunk so the model understands
-    /// continuity (who's talking, ongoing topic).
-    static let contextOverlap = 2
+    /// Read-only context segments included around the current chunk so the model understands
+    /// continuity (who's talking, ongoing topic). Larger chunks can afford a little more overlap
+    /// without materially increasing the number of calls.
+    static let contextOverlap = 4
+
+    /// Generation cap for one refined chunk. 30 segments should normally fit far below this, but
+    /// this leaves room for longer segments without letting a malformed generation run forever.
+    private static let maxGeneratedTokens = 4_096
 
     /// Reported back to the caller so the UI can label each phase distinctly.
     /// `.downloadingModel` carries a 0…1 fraction plus raw byte counts (so the UI can show
-    /// "3.4 GB z 7.0 GB"); `.refining` carries a 0…1 fraction; `.loadingModel` is indeterminate
+    /// "5.4 GB z 6.1 GB"); `.refining` carries a 0…1 fraction; `.loadingModel` is indeterminate
     /// — parsing safetensors + JIT-compiling Metal kernels happens after download completes
     /// and the underlying API doesn't expose progress for it.
     enum ProgressStage {
@@ -64,6 +67,20 @@ final class TranscriptRefiner {
     }
 
     private var modelContainer: ModelContainer?
+
+    /// Release the loaded Qwen container and MLX's reusable Metal buffers. The on-disk
+    /// Hugging Face cache is left intact, so the next refine run reloads from disk without
+    /// downloading the ~6 GB weights again.
+    func unloadModelFromMemory() {
+        let hadModel = modelContainer != nil
+        modelContainer = nil
+        Memory.clearCache()
+
+        if hadModel {
+            let snapshot = Memory.snapshot()
+            Log.refiner.info("released Qwen model memory; MLX active \(Self.formatBytes(snapshot.activeMemory), privacy: .public), cache \(Self.formatBytes(snapshot.cacheMemory), privacy: .public)")
+        }
+    }
 
     /// HubClient configured with a URLSession that **ignores system proxy / WPAD config**.
     ///
@@ -276,6 +293,13 @@ final class TranscriptRefiner {
         return total
     }
 
+    private nonisolated static func formatBytes(_ bytes: Int) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .memory
+        return formatter.string(fromByteCount: Int64(bytes))
+    }
+
     /// Path that swift-huggingface's HubClient uses to cache a given repo. Mirrors the upstream
     /// `HubCache.default` layout (`Library/Caches/huggingface/hub/models--<org>--<repo>/`) so
     /// our disk poll watches the same directory the downloader writes to.
@@ -298,13 +322,27 @@ final class TranscriptRefiner {
             .system(systemPrompt),
             .user(userPrompt),
         ]
-        let userInput = UserInput(chat: chat)
-        // Temperature 0.3: Qwen 2.5 follows few-shot prompts reliably without needing the
-        // 0.5 we had to use for Mistral Nemo. Lower temp = same correction depth + fewer
-        // hallucinated changes (Mistral at 0.5 sometimes "corrected" already-correct words,
-        // e.g. "tuhle" → "touhle"). Generous max tokens to accommodate the longest plausible
-        // chunk (15 segments × ~50 tokens × margin).
-        let parameters = GenerateParameters(maxTokens: 4096, temperature: 0.3)
+        let userInput = UserInput(
+            chat: chat,
+            additionalContext: [
+                // Qwen 3.x chat templates support this hard switch. Without it the model can
+                // spend thousands of tokens in a reasoning preamble before producing the rows.
+                "enable_thinking": false
+            ]
+        )
+        // Low temperature keeps transcript editing deterministic. 8-bit KV cache is a pragmatic
+        // memory guard for Qwen 3.5 9B on a 16 GB M1 Pro when chunks carry more context.
+        let parameters = GenerateParameters(
+            maxTokens: Self.maxGeneratedTokens,
+            kvBits: 8,
+            kvGroupSize: 64,
+            temperature: 0.3,
+            topP: 0.8,
+            topK: 20,
+            repetitionPenalty: 1.05,
+            repetitionContextSize: 256,
+            prefillStepSize: 768
+        )
 
         let lmInput = try await container.prepare(input: userInput)
         let stream = try await container.generate(input: lmInput, parameters: parameters)
@@ -325,6 +363,10 @@ final class TranscriptRefiner {
     spoustou chyb — fonetické deformace, vymyšlená slova, chybějící hlásky, špatné koncovky. \
     Tvým úkolem JE je AGRESIVNĚ rekonstruovat do správné češtiny/angličtiny pomocí kontextu věty a okolí. \
     Nedělej jen kosmetické úpravy (čárky, velká písmena) — primárně oprav OBSAH slov.
+    /no_think
+
+    NIKDY nevypisuj myšlenkový postup, reasoning, analysis, "Thinking Process", vysvětlení, \
+    odrážky ani komentáře. Odpověď musí začít přímo řádkem [1].
 
     PRAVIDLO Č. 1 — REKONSTRUKCE FONETICKY DEFORMOVANÝCH SLOV:
     Pokud slovo NENÍ reálné české (nebo anglické tech-term) slovo, je foneticky podobné nějakému \
@@ -388,6 +430,8 @@ final class TranscriptRefiner {
         nameFor: (UUID?) -> String
     ) -> String {
         var lines: [String] = []
+        lines.append("/no_think")
+        lines.append("")
         lines.append("Oprav následující segmenty přepisu. Vrať přesně \(refineRange.count) řádků se stejnými indexy [1]–[\(refineRange.count)].")
         lines.append("")
 
@@ -426,6 +470,7 @@ final class TranscriptRefiner {
     /// line was malformed (caller keeps the original for that index — per-segment graceful
     /// fallback so a single bad line doesn't void the whole chunk).
     private func parseResponse(_ response: String, expectedCount: Int) -> [String?] {
+        let response = Self.stripReasoning(from: response)
         var slots: [String?] = Array(repeating: nil, count: expectedCount)
         for rawLine in response.split(whereSeparator: { $0.isNewline }) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
@@ -443,6 +488,54 @@ final class TranscriptRefiner {
             let text = afterBracket[afterBracket.index(after: sep)...].trimmingCharacters(in: .whitespaces)
             slots[idx - 1] = text
         }
+        let parsedCount = slots.reduce(0) { $0 + ($1 == nil ? 0 : 1) }
+        if expectedCount >= 8, parsedCount > 0, parsedCount < expectedCount / 2 {
+            Log.refiner.debug("parsed only \(parsedCount, privacy: .public)/\(expectedCount, privacy: .public) lines; treating chunk response as malformed")
+            return Array(repeating: nil, count: expectedCount)
+        }
         return slots
+    }
+
+    /// Qwen 3.x can emit reasoning even when asked not to, especially if the chat template's
+    /// thinking switch is not honored by the runtime. Strip that preamble before parsing so a
+    /// valid final block still survives.
+    private nonisolated static func stripReasoning(from response: String) -> String {
+        var output = response
+
+        while let open = output.range(of: "<think>", options: [.caseInsensitive]),
+              let close = output.range(of: "</think>", options: [.caseInsensitive], range: open.upperBound..<output.endIndex) {
+            output.removeSubrange(open.lowerBound..<close.upperBound)
+        }
+        if let closeOnly = output.range(of: "</think>", options: [.caseInsensitive]) {
+            output = String(output[closeOnly.upperBound...])
+        }
+
+        for marker in ["Final Answer:", "Final response:", "Corrected segments:", "Opravené segmenty:"] {
+            if let range = output.range(of: marker, options: [.caseInsensitive]) {
+                let suffix = String(output[range.upperBound...])
+                if containsFirstOutputLine(suffix) {
+                    output = suffix
+                    break
+                }
+            }
+        }
+
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if let lastOutputStart = lines.indices.last(where: { isBracketedOutputLine(lines[$0], index: 1) }) {
+            output = lines[lastOutputStart...].joined(separator: "\n")
+        }
+
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private nonisolated static func containsFirstOutputLine(_ text: String) -> Bool {
+        text.split(whereSeparator: { $0.isNewline }).contains {
+            isBracketedOutputLine(String($0), index: 1)
+        }
+    }
+
+    private nonisolated static func isBracketedOutputLine(_ line: String, index: Int) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return trimmed.hasPrefix("[\(index)]")
     }
 }
