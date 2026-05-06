@@ -141,6 +141,12 @@ final class TranscriptRefiner {
                     systemPrompt: Self.systemInstructions,
                     userPrompt: userPrompt
                 )
+                // Re-check cancellation immediately after the LLM call returns. The next
+                // iteration's check at line ~124 fires only after parseResponse + per-segment
+                // diff logging, which on long chunks delays the user's "Zrušit" feedback by
+                // several seconds. Catching it here makes refine bail right when the heavy work
+                // finishes instead of running another full chunk.
+                try Task.checkCancellation()
                 let elapsed = Date().timeIntervalSince(cT0)
 
                 // Diagnostic: dump raw LLM response so we can tell whether the model returned
@@ -167,6 +173,10 @@ final class TranscriptRefiner {
                 }
                 let unchanged = (end - i) - changed - skipped
                 Log.refiner.info("chunk \(chunkIdx + 1, privacy: .public)/\(totalChunks, privacy: .public): \(end - i, privacy: .public) segments in \(elapsed, format: .fixed(precision: 2), privacy: .public)s (\(changed, privacy: .public) changed, \(unchanged, privacy: .public) unchanged, \(skipped, privacy: .public) parse-skipped)")
+            } catch is CancellationError {
+                // Don't swallow cancel — propagate so the outer Task observes it and the caller
+                // can revert .running → .done with the original artifact untouched.
+                throw CancellationError()
             } catch {
                 Log.refiner.error("chunk \(chunkIdx + 1, privacy: .public)/\(totalChunks, privacy: .public) FAILED: \(error.localizedDescription, privacy: .public) — keeping originals")
             }

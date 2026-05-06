@@ -3,9 +3,9 @@ import Combine
 
 @MainActor
 final class AppState: ObservableObject {
-    let speakers = SpeakerStore()
-    let recordings = RecordingStore()
-    let recorder = AudioRecorder()
+    let speakers: SpeakerStore
+    let recordings: RecordingStore
+    let recorder: AudioRecorder
 
     @Published var selectedRecordingId: UUID?
     @Published var globalError: String?
@@ -33,8 +33,31 @@ final class AppState: ObservableObject {
     /// between clicking Zrušit and the catch site flipping status to `.failed`.
     @Published private(set) var cancellingIds: Set<UUID> = []
 
-    init() {
-        let transcriber = WhisperKitTranscriber()
+    /// Designated initializer with injectable collaborators. Defaults wire the production
+    /// classes; tests pass in-memory stores and lightweight stubs to avoid touching disk and
+    /// loading multi-GB ML models. Pipeline always runs against the protocol-typed services
+    /// (TranscriptionService / DiarizationService / SpeakerEmbeddingService), so a stub-driven
+    /// integration test can exercise the full coordinator without WhisperKit / FluidAudio.
+    init(
+        speakers: SpeakerStore? = nil,
+        recordings: RecordingStore? = nil,
+        recorder: AudioRecorder? = nil,
+        transcriber: WhisperKitTranscriber? = nil,
+        pipelineTranscriber: TranscriptionService? = nil,
+        pipelineDiarizer: DiarizationService? = nil,
+        pipelineEmbedder: SpeakerEmbeddingService? = nil,
+        autoPreload: Bool = true
+    ) {
+        // Defaults are constructed lazily inside the body because @MainActor classes can't be
+        // referenced from non-isolated default-argument expressions. Tests pass explicit
+        // instances; production calls AppState() and gets the standard wiring.
+        let speakers = speakers ?? SpeakerStore()
+        let recordings = recordings ?? RecordingStore()
+        let recorder = recorder ?? AudioRecorder()
+        let transcriber = transcriber ?? WhisperKitTranscriber()
+        self.speakers = speakers
+        self.recordings = recordings
+        self.recorder = recorder
         self.transcriber = transcriber
 
         let diarizationService: DiarizationService
@@ -42,17 +65,17 @@ final class AppState: ObservableObject {
         #if canImport(FluidAudio)
         let fluid = FluidAudioDiarizer()
         self.diarizer = fluid
-        diarizationService = fluid
-        embeddingService = fluid
+        diarizationService = pipelineDiarizer ?? fluid
+        embeddingService = pipelineEmbedder ?? fluid
         #else
         let stub = StubDiarizer()
-        diarizationService = stub
-        embeddingService = stub
+        diarizationService = pipelineDiarizer ?? stub
+        embeddingService = pipelineEmbedder ?? stub
         #endif
 
         let identifier = SpeakerIdentifier(store: speakers)
         self.pipeline = PipelineCoordinator(
-            transcriber: transcriber,
+            transcriber: pipelineTranscriber ?? transcriber,
             diarizer: diarizationService,
             embedder: embeddingService,
             identifier: identifier,
@@ -82,11 +105,14 @@ final class AppState: ObservableObject {
         // Warm up models sequentially. Parallel cold-start peaks ~3–4 GB during simultaneous
         // ANE graph compilation (Whisper Turbo + pyannote + wespeaker) and gets jetsamed on
         // 16 GB Macs. Sequential adds ~5–10 s to TTFR but survives cold cache.
-        Task {
-            await transcriber.preload()
-            #if canImport(FluidAudio)
-            await fluid.preload()
-            #endif
+        // Skipped in tests via autoPreload=false to keep them under a second.
+        if autoPreload {
+            Task {
+                await transcriber.preload()
+                #if canImport(FluidAudio)
+                await fluid.preload()
+                #endif
+            }
         }
     }
 
@@ -130,6 +156,19 @@ final class AppState: ObservableObject {
             cancellingIds.insert(recording.id)
             task.cancel()
         }
+    }
+
+    /// Delete a recording, cancelling its in-flight pipeline task first. Without the upfront
+    /// cancel, the pipeline's catch site would keep writing to disk (status flip + saveArtifact)
+    /// after `recordings.delete(...)` already removed the index entry, leaving orphaned files.
+    func deleteRecording(_ id: UUID) {
+        if let task = inflightTasks[id] {
+            Log.app.info("deleting recording with in-flight task — cancelling first: \(id, privacy: .public)")
+            task.cancel()
+            inflightTasks[id] = nil
+            cancellingIds.remove(id)
+        }
+        recordings.delete(id)
     }
 
     /// Format Foundation's `Progress` byte counts into a Czech "completed z total" string for

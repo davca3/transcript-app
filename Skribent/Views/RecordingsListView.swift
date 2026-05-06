@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct RecordingsListView: View {
+    @EnvironmentObject var state: AppState
     @EnvironmentObject var recordings: RecordingStore
     @Binding var selection: UUID?
 
@@ -27,7 +28,7 @@ struct RecordingsListView: View {
     }
 
     private func delete(_ id: UUID) {
-        recordings.delete(id)
+        state.deleteRecording(id)
         if selection == id { selection = nil }
     }
 }
