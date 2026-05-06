@@ -97,7 +97,6 @@ final class RecordingStore: ObservableObject {
 
     init() {
         load()
-        cleanupOrphanedFolders()
     }
 
     func load() {
@@ -109,37 +108,6 @@ final class RecordingStore: ObservableObject {
         } catch {
             Log.store.error("RecordingStore load error: \(error.localizedDescription, privacy: .public)")
             lastError = error
-        }
-    }
-
-    /// Delete recording folders that aren't referenced by any entry in the index. Runs once at
-    /// startup to clean up after force-quits or partial-write crashes that leave audio.wav /
-    /// transcript.json under a UUID directory the index never recorded.
-    private func cleanupOrphanedFolders() {
-        let root = Self.recordingsRoot
-        guard let entries = try? FileManager.default.contentsOfDirectory(
-            at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-
-        let knownIds = Set(recordings.map(\.id.uuidString))
-        var removed = 0
-        for entry in entries {
-            let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-            guard isDir, !knownIds.contains(entry.lastPathComponent) else { continue }
-            // Defensive: only delete folders whose name parses as a UUID — never touch anything
-            // a future feature might park under recordings/ for some other purpose.
-            guard UUID(uuidString: entry.lastPathComponent) != nil else { continue }
-            do {
-                try FileManager.default.removeItem(at: entry)
-                removed += 1
-            } catch {
-                Log.store.notice("orphan cleanup failed for \(entry.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
-            }
-        }
-        if removed > 0 {
-            Log.store.info("cleaned up \(removed, privacy: .public) orphaned recording folder(s)")
         }
     }
 
