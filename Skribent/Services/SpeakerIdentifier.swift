@@ -31,7 +31,7 @@ final class SpeakerIdentifier {
         let snapshots: [SpeakerSnapshot] = store.speakers.map {
             SpeakerSnapshot(id: $0.id, name: $0.name, centroid: $0.centroid)
         }
-        print("[SpeakerID] threshold=\(matchThreshold), clusters=\(clusters.count), known=\(snapshots.count)")
+        Log.speaker.info("threshold=\(self.matchThreshold, privacy: .public), clusters=\(clusters.count, privacy: .public), known=\(snapshots.count, privacy: .public)")
 
         // Per-cluster best-score (incl. below threshold), for tuning visibility.
         var bestPerCluster: [Int: (name: String, score: Float)] = [:]
@@ -52,15 +52,14 @@ final class SpeakerIdentifier {
             }
             if let b = best {
                 let cluster = pool.remove(at: b.poolIdx)
-                print(String(format: "[SpeakerID] ✓ cluster %d → \"%@\" (score %.3f)", cluster.clusterId, b.name, b.score))
+                Log.speaker.info("✓ cluster \(cluster.clusterId, privacy: .public) → \"\(b.name, privacy: .public)\" (score \(b.score, format: .fixed(precision: 3), privacy: .public))")
                 assignments[cluster.clusterId] = .known(speakerId: b.speakerId, name: b.name, score: b.score)
                 usedSpeakerIds.insert(b.speakerId)
             } else {
                 // Log best per remaining cluster so the user sees how close they were.
                 for c in pool {
                     if let bp = bestPerCluster[c.clusterId] {
-                        print(String(format: "[SpeakerID] · cluster %d best: \"%@\" %.3f (below %.2f)",
-                                     c.clusterId, bp.name, bp.score, matchThreshold))
+                        Log.speaker.info("· cluster \(c.clusterId, privacy: .public) best: \"\(bp.name, privacy: .public)\" \(bp.score, format: .fixed(precision: 3), privacy: .public) (below \(self.matchThreshold, format: .fixed(precision: 2), privacy: .public))")
                     }
                 }
                 break

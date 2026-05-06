@@ -56,7 +56,7 @@ final class SystemAudioCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             try await stream.startCapture()
             self.stream = stream
-            print("[SystemAudio] capture started → \(url.path)")
+            Log.systemAudio.info("capture started → \(url.path, privacy: .public)")
         } catch {
             self.stream = nil
             self.outputURL = nil
@@ -71,11 +71,11 @@ final class SystemAudioCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
         do {
             try await s.stopCapture()
         } catch {
-            print("[SystemAudio] stopCapture error: \(error)")
+            Log.systemAudio.error("stopCapture error: \(error.localizedDescription, privacy: .public)")
         }
         stream = nil
         file = nil
-        print("[SystemAudio] stopped → \(outputURL?.path ?? "nil")")
+        Log.systemAudio.info("stopped → \(self.outputURL?.path ?? "nil", privacy: .public)")
         return outputURL
     }
 
@@ -95,12 +95,12 @@ final class SystemAudioCapturer: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             try file?.write(from: pcmBuffer)
         } catch {
-            print("[SystemAudio] write error: \(error)")
+            Log.systemAudio.error("write error: \(error.localizedDescription, privacy: .public)")
         }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("[SystemAudio] stream stopped with error: \(error)")
+        Log.systemAudio.error("stream stopped with error: \(error.localizedDescription, privacy: .public)")
     }
 }
 

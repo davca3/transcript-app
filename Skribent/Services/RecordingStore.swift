@@ -40,9 +40,30 @@ struct StoredAssignment: Codable, Hashable {
     var embedding: [Float]
 }
 
+/// Lightweight per-recording snapshot used by the in-flight progress banner. Lives in its own
+/// dictionary so 4 Hz pipeline updates don't churn the recordings array (avoiding re-renders of
+/// the sidebar list, list rows, etc.).
+struct ProcessingTick: Equatable {
+    let stage: Recording.ProcessingStatus.Stage
+    let progress: Double
+}
+
 @MainActor
 final class RecordingStore: ObservableObject {
     @Published private(set) var recordings: [Recording] = []
+
+    /// In-memory artifact cache. Updated on every successful saveArtifact + invalidated on delete.
+    /// Views observe this so renaming/promoting a speaker re-renders without forcing a global
+    /// AppState publish. `loadArtifact` lazy-fills from disk on miss.
+    @Published private(set) var artifactsByRecording: [UUID: RecordingArtifact] = [:]
+
+    /// Latest non-fatal error from a load/save operation. AppState sinks this into globalError.
+    @Published var lastError: Error?
+
+    /// Per-recording in-flight progress snapshot driven by PipelineCoordinator. The whole entry
+    /// is dropped at terminal status (.done / .failed). Decoupled from `recordings` so the 250 ms
+    /// progress driver doesn't trigger a list-wide republish each tick.
+    @Published var processingProgress: [UUID: ProcessingTick] = [:]
 
     nonisolated static var recordingsRoot: URL {
         let dir = AppPaths.appSupport.appendingPathComponent("recordings", isDirectory: true)
@@ -61,7 +82,8 @@ final class RecordingStore: ObservableObject {
             recordings = try JSONDecoder().decode([Recording].self, from: data)
                 .sorted { $0.createdAt > $1.createdAt }
         } catch {
-            print("RecordingStore load error: \(error)")
+            Log.store.error("RecordingStore load error: \(error.localizedDescription, privacy: .public)")
+            lastError = error
         }
     }
 
@@ -71,7 +93,8 @@ final class RecordingStore: ObservableObject {
             let data = try JSONEncoder().encode(recordings)
             try data.write(to: indexURL, options: .atomic)
         } catch {
-            print("RecordingStore save error: \(error)")
+            Log.store.error("RecordingStore save error: \(error.localizedDescription, privacy: .public)")
+            lastError = error
         }
     }
 
@@ -100,19 +123,32 @@ final class RecordingStore: ObservableObject {
 
     func delete(_ id: UUID) {
         if let r = recordings.first(where: { $0.id == id }) {
-            try? FileManager.default.removeItem(at: r.folderURL)
+            do {
+                try FileManager.default.removeItem(at: r.folderURL)
+            } catch CocoaError.fileNoSuchFile {
+                // Already gone (manual cleanup, prior partial delete) — fine.
+            } catch {
+                Log.store.error("RecordingStore delete error: \(error.localizedDescription, privacy: .public)")
+                lastError = error
+            }
         }
         recordings.removeAll { $0.id == id }
+        artifactsByRecording[id] = nil
+        processingProgress[id] = nil
         save()
     }
 
     func loadArtifact(for rec: Recording) -> RecordingArtifact? {
+        if let cached = artifactsByRecording[rec.id] { return cached }
         guard FileManager.default.fileExists(atPath: rec.transcriptURL.path) else { return nil }
         do {
             let data = try Data(contentsOf: rec.transcriptURL)
-            return try JSONDecoder().decode(RecordingArtifact.self, from: data)
+            let artifact = try JSONDecoder().decode(RecordingArtifact.self, from: data)
+            artifactsByRecording[rec.id] = artifact
+            return artifact
         } catch {
-            print("loadArtifact error: \(error)")
+            Log.store.error("loadArtifact error: \(error.localizedDescription, privacy: .public)")
+            lastError = error
             return nil
         }
     }
@@ -122,8 +158,10 @@ final class RecordingStore: ObservableObject {
             try FileManager.default.createDirectory(at: rec.folderURL, withIntermediateDirectories: true)
             let data = try JSONEncoder().encode(artifact)
             try data.write(to: rec.transcriptURL, options: .atomic)
+            artifactsByRecording[rec.id] = artifact
         } catch {
-            print("saveArtifact error: \(error)")
+            Log.store.error("saveArtifact error: \(error.localizedDescription, privacy: .public)")
+            lastError = error
         }
     }
 }

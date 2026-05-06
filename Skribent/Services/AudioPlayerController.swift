@@ -36,7 +36,7 @@ final class AudioPlayerController: ObservableObject {
             self.duration = p.duration
             self.progress.currentTime = 0
         } catch {
-            print("[AudioPlayer] load failed: \(error)")
+            Log.player.error("load failed: \(error.localizedDescription, privacy: .public)")
             self.player = nil
         }
     }

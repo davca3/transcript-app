@@ -39,8 +39,7 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
     /// `WhisperKit.download(...)` entirely — that call takes 5+ seconds even for cache hits
     /// (validation + remote file listing), which is what makes the banner blink on every launch.
     private func cachedModelFolder() -> URL? {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let folder = docs
+        let folder = AppPaths.documents
             .appendingPathComponent("huggingface", isDirectory: true)
             .appendingPathComponent("models", isDirectory: true)
             .appendingPathComponent("argmaxinc", isDirectory: true)
@@ -53,13 +52,13 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
     /// Preload model in the background. Call from app launch so first transcription is instant.
     func preload() async {
         guard pipe == nil else { return }
-        print("[WhisperKit] preload start: model=\(modelName)")
+        Log.transcriber.info("preload start: model=\(self.modelName, privacy: .public)")
         let t0 = Date()
         state = .idle
 
         let folderURL: URL
         if let cached = cachedModelFolder() {
-            print("[WhisperKit] cache hit → \(cached.path) (skipping download)")
+            Log.transcriber.info("cache hit → \(cached.path, privacy: .public) (skipping download)")
             folderURL = cached
         } else {
             // Real download path: reveal banner after 500ms (so very fast networks still skip it).
@@ -76,8 +75,7 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
                     progressCallback: { progress in
                         let frac = progress.fractionCompleted
                         if lastLogged.shouldLog(frac: frac) {
-                            print(String(format: "[WhisperKit] download progress %.1f%% (%lld / %lld)",
-                                         frac * 100, progress.completedUnitCount, progress.totalUnitCount))
+                            Log.transcriber.info("download progress \(frac * 100, format: .fixed(precision: 1), privacy: .public)% (\(progress.completedUnitCount, privacy: .public) / \(progress.totalUnitCount, privacy: .public))")
                         }
                         Task { @MainActor [weak self] in
                             guard let self, case .downloading = self.state else { return }
@@ -86,11 +84,11 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
                     }
                 )
                 revealBannerTask.cancel()
-                print("[WhisperKit] download done in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s → \(folderURL.path)")
+                Log.transcriber.info("download done in \(Date().timeIntervalSince(t0), format: .fixed(precision: 1), privacy: .public)s → \(folderURL.path, privacy: .public)")
             } catch {
                 revealBannerTask.cancel()
                 self.state = .failed(error.localizedDescription)
-                print("[WhisperKit] preload FAILED (download): \(error)")
+                Log.transcriber.error("preload FAILED (download): \(error.localizedDescription, privacy: .public)")
                 return
             }
         }
@@ -108,7 +106,7 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
         )
         state = .loadingIntoMemory
         let t1 = Date()
-        print("[WhisperKit] loading model into memory (prewarm disabled, ANE \(useANE ? "ENABLED" : "disabled"))…")
+        Log.transcriber.info("loading model into memory (prewarm disabled, ANE \(useANE ? "ENABLED" : "disabled", privacy: .public))…")
         do {
             let config = WhisperKitConfig(
                 model: modelName,
@@ -122,17 +120,17 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
             let p = try await WhisperKit(config)
             self.pipe = p
             self.state = .ready
-            print("[WhisperKit] load done in \(String(format: "%.1f", Date().timeIntervalSince(t1)))s (total \(String(format: "%.1f", Date().timeIntervalSince(t0)))s)")
+            Log.transcriber.info("load done in \(Date().timeIntervalSince(t1), format: .fixed(precision: 1), privacy: .public)s (total \(Date().timeIntervalSince(t0), format: .fixed(precision: 1), privacy: .public)s)")
         } catch {
             self.state = .failed(error.localizedDescription)
-            print("[WhisperKit] preload FAILED (load): \(error)")
+            Log.transcriber.error("preload FAILED (load): \(error.localizedDescription, privacy: .public)")
         }
     }
 
     func transcribe(samples: [Float], languageHint: String?) async throws -> Transcript {
         let pipe = try await ensureLoaded()
         let durationSec = Double(samples.count) / 16000
-        print("[WhisperKit] transcribe \(samples.count) samples (\(String(format: "%.1f", durationSec))s)")
+        Log.transcriber.info("transcribe \(samples.count, privacy: .public) samples (\(durationSec, format: .fixed(precision: 1), privacy: .public)s)")
         let t0 = Date()
 
         // Parallel chunks: significantly speeds up long meetings on Apple Silicon.
@@ -157,8 +155,7 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
         let results = try await pipe.transcribe(audioArray: samples, decodeOptions: options)
         let elapsed = Date().timeIntervalSince(t0)
         let xRealtime = durationSec / max(elapsed, 0.01)
-        print(String(format: "[WhisperKit] transcribe done in %.1fs (%.1f× realtime, %d worker(s)), results=%d",
-                     elapsed, xRealtime, workers, results.count))
+        Log.transcriber.info("transcribe done in \(elapsed, format: .fixed(precision: 1), privacy: .public)s (\(xRealtime, format: .fixed(precision: 1), privacy: .public)× realtime, \(workers, privacy: .public) worker(s)), results=\(results.count, privacy: .public)")
 
         var segments: [TranscriptSegment] = []
         var language: String?
@@ -180,6 +177,7 @@ final class WhisperKitTranscriber: TranscriptionService, ObservableObject {
 
     /// Strip Whisper special tokens like `<|startoftranscript|>` and trim.
     /// `skipSpecialTokens: true` should already do this; this is a defensive belt+suspenders.
+    // Safe: literal pattern, NSRegularExpression compile cannot throw at runtime.
     private static let specialTokenRegex = try! NSRegularExpression(pattern: #"<\|[^|]*\|>"#)
     private static func cleanText(_ text: String) -> String {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)

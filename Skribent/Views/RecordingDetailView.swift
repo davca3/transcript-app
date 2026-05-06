@@ -26,7 +26,7 @@ struct RecordingDetailView: View {
             header
             Divider()
             ProgressBanner(
-                status: recording.status,
+                status: effectiveStatus,
                 detail: state.processingDetail,
                 onCancel: { state.cancelProcessing(for: recording) },
                 isCancelling: state.cancellingIds.contains(recording.id),
@@ -57,8 +57,16 @@ struct RecordingDetailView: View {
             player.load(recording.audioURL)
         }
         .onChange(of: recording.status) {
-            if case .done = recording.status { reload() }
-            if case .failed = recording.status { reload() }
+            switch recording.status {
+            case .done, .failed: reload()
+            default: break
+            }
+        }
+        // Pick up artifact changes from speaker rename/promote/unassign/merge — those write to
+        // recordings.artifactsByRecording inside saveArtifact, so observing the dict gives us a
+        // direct reactive path without forcing AppState-wide objectWillChange.
+        .onChange(of: recordings.artifactsByRecording[recording.id]) {
+            reload()
         }
         .fileExporter(
             isPresented: Binding(get: { exporterDoc != nil }, set: { if !$0 { exporterDoc = nil } }),
@@ -286,6 +294,17 @@ struct RecordingDetailView: View {
     private var isProcessing: Bool {
         if case .running = recording.status { return true }
         return false
+    }
+
+    /// Banner status: when the pipeline is mid-flight, overlay the in-memory progress tick onto
+    /// `recording.status`. The tick lives in `RecordingStore.processingProgress` and updates 4×/s
+    /// without churning the recordings array (so list views don't re-render every 250 ms).
+    private var effectiveStatus: Recording.ProcessingStatus {
+        guard case .running = recording.status,
+              let tick = recordings.processingProgress[recording.id] else {
+            return recording.status
+        }
+        return .running(stage: tick.stage, progress: tick.progress)
     }
 
     /// Find the next segment belonging to any of the chip's underlying clusters, after the

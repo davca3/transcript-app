@@ -24,7 +24,7 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
     /// Banner only reveals if download takes >500ms — cache hits stay invisible.
     func preload() async {
         guard manager == nil else { return }
-        print("[FluidAudio] preload start")
+        Log.diarizer.info("preload start")
         let t0 = Date()
         state = .idle
 
@@ -36,18 +36,18 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
 
         do {
             let models = try await DiarizerModels.downloadIfNeeded()
-            print("[FluidAudio] models downloaded/cached in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+            Log.diarizer.info("models downloaded/cached in \(Date().timeIntervalSince(t0), format: .fixed(precision: 1), privacy: .public)s")
             revealBannerTask.cancel()
             state = .loadingIntoMemory
             let m = DiarizerManager(config: .default)
             m.initialize(models: models)
             self.manager = m
             self.state = .ready
-            print("[FluidAudio] ready in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
+            Log.diarizer.info("ready in \(Date().timeIntervalSince(t0), format: .fixed(precision: 1), privacy: .public)s")
         } catch {
             revealBannerTask.cancel()
             self.state = .failed(error.localizedDescription)
-            print("[FluidAudio] preload FAILED: \(error)")
+            Log.diarizer.error("preload FAILED: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -64,7 +64,7 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
     func diarize(samples: [Float]) async throws -> [SpeakerTurn] {
         let m = try await ensureLoaded()
         let durationSec = Double(samples.count) / 16000
-        print("[FluidAudio] diarize \(samples.count) samples (\(String(format: "%.1f", durationSec))s)")
+        Log.diarizer.info("diarize \(samples.count, privacy: .public) samples (\(durationSec, format: .fixed(precision: 1), privacy: .public)s)")
         let t0 = Date()
 
         // Short audio: no benefit from chunking — single call is faster (no overhead, larger
@@ -72,7 +72,7 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
         let chunkSec = Self.parallelChunkSeconds
         if durationSec < chunkSec * 1.5 {
             let result = try await m.performCompleteDiarization(samples, sampleRate: Int(AudioUtils.targetSampleRate))
-            print("[FluidAudio] diarize done (single) in \(String(format: "%.1f", Date().timeIntervalSince(t0)))s, segments=\(result.segments.count)")
+            Log.diarizer.info("diarize done (single) in \(Date().timeIntervalSince(t0), format: .fixed(precision: 1), privacy: .public)s, segments=\(result.segments.count, privacy: .public)")
             return mapSegments(result.segments, chunkIndex: 0)
         }
 
@@ -91,7 +91,7 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
         }
 
         let maxConcurrent = Self.parallelMaxConcurrent
-        print("[FluidAudio] parallel diarize: \(ranges.count) chunk(s) of ~\(Int(chunkSec))s, max \(maxConcurrent) concurrent")
+        Log.diarizer.info("parallel diarize: \(ranges.count, privacy: .public) chunk(s) of ~\(Int(chunkSec), privacy: .public)s, max \(maxConcurrent, privacy: .public) concurrent")
 
         // Throttled task group: keep at most `maxConcurrent` chunks in flight so RAM peak stays
         // bounded on long recordings. Order doesn't matter — turns are unioned.
@@ -113,10 +113,9 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
                         atTime: chunkStartSec
                     )
                     let elapsed = Date().timeIntervalSince(cT0)
-                    print(String(format: "[FluidAudio]   chunk %d: %.1fs audio → %.1fs wall (%.1f× rt), %d segments",
-                                 idx, Double(chunkSlice.count) / 16000, elapsed,
-                                 (Double(chunkSlice.count) / 16000) / max(elapsed, 0.01),
-                                 result.segments.count))
+                    let audioSec = Double(chunkSlice.count) / 16000
+                    let xRt = audioSec / max(elapsed, 0.01)
+                    Log.diarizer.info("  chunk \(idx, privacy: .public): \(audioSec, format: .fixed(precision: 1), privacy: .public)s audio → \(elapsed, format: .fixed(precision: 1), privacy: .public)s wall (\(xRt, format: .fixed(precision: 1), privacy: .public)× rt), \(result.segments.count, privacy: .public) segments")
                     return self.mapSegments(result.segments, chunkIndex: idx)
                 }
                 inFlight += 1
@@ -133,8 +132,7 @@ final class FluidAudioDiarizer: DiarizationService, SpeakerEmbeddingService, Obs
         }
 
         let elapsed = Date().timeIntervalSince(t0)
-        print(String(format: "[FluidAudio] parallel diarize done in %.1fs (%.1f× realtime), turns=%d",
-                     elapsed, durationSec / max(elapsed, 0.01), collected.count))
+        Log.diarizer.info("parallel diarize done in \(elapsed, format: .fixed(precision: 1), privacy: .public)s (\(durationSec / max(elapsed, 0.01), format: .fixed(precision: 1), privacy: .public)× realtime), turns=\(collected.count, privacy: .public)")
         // Sort by start time so downstream stitching sees a chronological turn list.
         collected.sort { $0.start < $1.start }
         return collected

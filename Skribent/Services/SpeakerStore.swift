@@ -4,6 +4,9 @@ import Combine
 @MainActor
 final class SpeakerStore: ObservableObject {
     @Published private(set) var speakers: [Speaker] = []
+    /// Latest non-fatal error from a load/save operation. AppState sinks this into globalError so
+    /// the UI can surface it. Auto-clears when set to nil by the consumer.
+    @Published var lastError: Error?
 
     private let fileURL: URL
 
@@ -24,7 +27,8 @@ final class SpeakerStore: ObservableObject {
             let data = try Data(contentsOf: fileURL)
             speakers = try JSONDecoder().decode([Speaker].self, from: data)
         } catch {
-            print("SpeakerStore load error: \(error)")
+            Log.store.error("SpeakerStore load error: \(error.localizedDescription, privacy: .public)")
+            lastError = error
         }
     }
 
@@ -33,7 +37,8 @@ final class SpeakerStore: ObservableObject {
             let data = try JSONEncoder().encode(speakers)
             try data.write(to: fileURL, options: .atomic)
         } catch {
-            print("SpeakerStore save error: \(error)")
+            Log.store.error("SpeakerStore save error: \(error.localizedDescription, privacy: .public)")
+            lastError = error
         }
     }
 
@@ -55,7 +60,7 @@ final class SpeakerStore: ObservableObject {
               let idx = speakers.firstIndex(where: { $0.id == speakerId }) else { return }
         var s = speakers[idx]
         if let firstDim = s.embeddings.first?.count, firstDim != embedding.count {
-            print("[SpeakerStore] dim mismatch on \"\(s.name)\" (\(firstDim) → \(embedding.count)); resetting samples")
+            Log.store.notice("dim mismatch on \"\(s.name, privacy: .public)\" (\(firstDim, privacy: .public) → \(embedding.count, privacy: .public)); resetting samples")
             s.embeddings = [embedding]
         } else {
             s.embeddings.append(embedding)
@@ -76,12 +81,5 @@ final class SpeakerStore: ObservableObject {
     func delete(_ speakerId: UUID) {
         speakers.removeAll { $0.id == speakerId }
         save()
-    }
-}
-
-enum AppPaths {
-    static var appSupport: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("Skribent", isDirectory: true)
     }
 }

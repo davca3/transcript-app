@@ -147,7 +147,7 @@ final class TranscriptRefiner {
                 // input verbatim (model issue) or something different that the parser later
                 // re-aligned to the original (parser issue). Truncated to 1200 chars.
                 let preview = response.count > 1200 ? String(response.prefix(1200)) + "\n…[truncated, total \(response.count) chars]" : response
-                print("[Refiner] chunk \(chunkIdx + 1)/\(totalChunks) raw response:\n\(preview)\n[Refiner] --- end of raw response ---")
+                Log.refiner.debug("chunk \(chunkIdx + 1, privacy: .public)/\(totalChunks, privacy: .public) raw response:\n\(preview, privacy: .public)\n--- end of raw response ---")
 
                 let parsed = parseResponse(response, expectedCount: end - i)
                 var changed = 0
@@ -156,22 +156,19 @@ final class TranscriptRefiner {
                     let oldText = refined[i + offset].text
                     guard let newText = parsed[offset] else {
                         skipped += 1
-                        print("[Refiner]   [\(offset + 1)] PARSE FAILED — keeping original: \(oldText)")
+                        Log.refiner.debug("  [\(offset + 1, privacy: .public)] PARSE FAILED — keeping original: \(oldText)")
                         continue
                     }
                     if oldText != newText {
                         changed += 1
-                        print("[Refiner]   [\(offset + 1)] CHANGED")
-                        print("[Refiner]     OLD: \(oldText)")
-                        print("[Refiner]     NEW: \(newText.isEmpty ? "(empty — segment will be dropped)" : newText)")
+                        Log.refiner.debug("  [\(offset + 1, privacy: .public)] CHANGED OLD: \(oldText) NEW: \(newText.isEmpty ? "(empty — segment will be dropped)" : newText)")
                     }
                     refined[i + offset].text = newText
                 }
                 let unchanged = (end - i) - changed - skipped
-                print(String(format: "[Refiner] chunk %d/%d: %d segments in %.2fs (%d changed, %d unchanged, %d parse-skipped)",
-                             chunkIdx + 1, totalChunks, end - i, elapsed, changed, unchanged, skipped))
+                Log.refiner.info("chunk \(chunkIdx + 1, privacy: .public)/\(totalChunks, privacy: .public): \(end - i, privacy: .public) segments in \(elapsed, format: .fixed(precision: 2), privacy: .public)s (\(changed, privacy: .public) changed, \(unchanged, privacy: .public) unchanged, \(skipped, privacy: .public) parse-skipped)")
             } catch {
-                print("[Refiner] chunk \(chunkIdx + 1)/\(totalChunks) FAILED: \(error) — keeping originals")
+                Log.refiner.error("chunk \(chunkIdx + 1, privacy: .public)/\(totalChunks, privacy: .public) FAILED: \(error.localizedDescription, privacy: .public) — keeping originals")
             }
 
             chunkIdx += 1
@@ -190,7 +187,7 @@ final class TranscriptRefiner {
 
     private func ensureLoaded(progress: @escaping (ProgressStage) -> Void) async throws -> ModelContainer {
         if let modelContainer { return modelContainer }
-        print("[Refiner] resolving \(Self.modelConfiguration.id) (downloads on first run)…")
+        Log.refiner.info("resolving \(Self.modelRepoId, privacy: .public) (downloads on first run)…")
         let t0 = Date()
 
         // HubClient's `progressHandler` only fires per-file-completion, so during a multi-GB
@@ -241,8 +238,7 @@ final class TranscriptRefiner {
                 totalBytes: Swift.max(finalSize, totalBox.value)
             ))
             let dlElapsed = Date().timeIntervalSince(t0)
-            print(String(format: "[Refiner] download phase done in %.1fs (%.1f GB on disk), loading into memory…",
-                         dlElapsed, Double(finalSize) / 1_000_000_000))
+            Log.refiner.info("download phase done in \(dlElapsed, format: .fixed(precision: 1), privacy: .public)s (\(Double(finalSize) / 1_000_000_000, format: .fixed(precision: 1), privacy: .public) GB on disk), loading into memory…")
 
             progress(.loadingModel)
             let loadStart = Date()
@@ -250,9 +246,7 @@ final class TranscriptRefiner {
                 from: resolved.modelDirectory,
                 using: #huggingFaceTokenizerLoader()
             )
-            print(String(format: "[Refiner] load-into-memory done in %.1fs (total %.1fs)",
-                         Date().timeIntervalSince(loadStart),
-                         Date().timeIntervalSince(t0)))
+            Log.refiner.info("load-into-memory done in \(Date().timeIntervalSince(loadStart), format: .fixed(precision: 1), privacy: .public)s (total \(Date().timeIntervalSince(t0), format: .fixed(precision: 1), privacy: .public)s)")
             self.modelContainer = container
             return container
         } catch {
@@ -286,9 +280,8 @@ final class TranscriptRefiner {
     /// `HubCache.default` layout (`Library/Caches/huggingface/hub/models--<org>--<repo>/`) so
     /// our disk poll watches the same directory the downloader writes to.
     private nonisolated static func hubCacheDir(for repoId: String) -> URL {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         let safeName = "models--" + repoId.replacingOccurrences(of: "/", with: "--")
-        return caches
+        return AppPaths.caches
             .appendingPathComponent("huggingface", isDirectory: true)
             .appendingPathComponent("hub", isDirectory: true)
             .appendingPathComponent(safeName, isDirectory: true)

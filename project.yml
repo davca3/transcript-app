@@ -52,6 +52,7 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSMinimumSystemVersion: "26.0"
         NSMicrophoneUsageDescription: "Skribent potřebuje přístup k mikrofonu pro nahrávání přepisů."
+        NSScreenCaptureUsageDescription: "Skribent zachytává systémový zvuk pro nahrávání schůzek a hovorů."
         NSHighResolutionCapable: true
     entitlements:
       path: Skribent/Resources/Skribent.entitlements
@@ -81,3 +82,17 @@ targets:
         product: Tokenizers
       - package: swift-huggingface
         product: HuggingFace
+
+  SkribentTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: SkribentTests
+    dependencies:
+      - target: Skribent
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Skribent.app/Contents/MacOS/Skribent"
+        PRODUCT_BUNDLE_IDENTIFIER: com.skribent.app.tests
+        GENERATE_INFOPLIST_FILE: YES

@@ -35,9 +35,9 @@ final class AudioRecorder: ObservableObject {
         // Switch input device if user picked a non-default one.
         if let uid = config.inputDeviceUID, let dev = AudioDeviceManager.device(forUID: uid) {
             try setInputDevice(dev.id)
-            print("[Recorder] using input device: \(dev.name)")
+            Log.recorder.info("using input device: \(dev.name, privacy: .public)")
         } else if let dflt = AudioDeviceManager.defaultInput() {
-            print("[Recorder] using system default input: \(dflt.name)")
+            Log.recorder.info("using system default input: \(dflt.name, privacy: .public)")
         }
 
         let input = engine.inputNode
@@ -77,7 +77,7 @@ final class AudioRecorder: ObservableObject {
                     try await cap.start()
                 } catch {
                     await MainActor.run { self?.systemCapturer = nil }
-                    print("[Recorder] system audio start failed: \(error)")
+                    Log.recorder.error("system audio start failed: \(error.localizedDescription, privacy: .public)")
                 }
             }
         }
@@ -124,12 +124,12 @@ final class AudioRecorder: ObservableObject {
             let sysSamples = try AudioUtils.loadAndResample(from: sysURL)
             let mixed = mix(a: micSamples, b: sysSamples)
             try AudioUtils.writeWav(samples: mixed, to: mixedURL)
-            print("[Recorder] mixed mic(\(micSamples.count)) + sys(\(sysSamples.count)) → \(mixed.count) samples @ 16k")
+            Log.recorder.info("mixed mic(\(micSamples.count, privacy: .public)) + sys(\(sysSamples.count, privacy: .public)) → \(mixed.count, privacy: .public) samples @ 16k")
             try? FileManager.default.removeItem(at: mic)
             try? FileManager.default.removeItem(at: sysURL)
             return mixedURL
         } catch {
-            print("[Recorder] mix failed: \(error). Falling back to mic-only.")
+            Log.recorder.error("mix failed: \(error.localizedDescription, privacy: .public). Falling back to mic-only.")
             return mic
         }
     }

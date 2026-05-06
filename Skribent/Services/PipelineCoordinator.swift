@@ -86,7 +86,7 @@ final class PipelineCoordinator {
             // consistent listening level. Mutates the 48 kHz buffer in place — by the time
             // we write the WAV, the pipeline branch is already a separate copy at 16 kHz.
             AudioUtils.loudnessNormalize(samples: &samples48k)
-            print(String(format: "[Pipeline] cleanup done in %.2fs", Date().timeIntervalSince(cleanT0)))
+            Log.pipeline.info("cleanup done in \(Date().timeIntervalSince(cleanT0), format: .fixed(precision: 2), privacy: .public)s")
             try AudioUtils.writeWav(samples: samples48k, to: rec.audioURL, sampleRate: AudioUtils.storedSampleRate)
 
             try Task.checkCancellation()
@@ -94,10 +94,12 @@ final class PipelineCoordinator {
         } catch is CancellationError {
             rec.status = .failed(message: "Zrušeno uživatelem")
             await publish(rec, persistImmediately: true, progress: progress)
-            print("[Pipeline] process cancelled by user")
+            await clearProgress(for: rec.id)
+            Log.pipeline.info("process cancelled by user")
         } catch {
             rec.status = .failed(message: error.localizedDescription)
             await publish(rec, persistImmediately: true, progress: progress)
+            await clearProgress(for: rec.id)
         }
     }
 
@@ -116,10 +118,21 @@ final class PipelineCoordinator {
         } catch is CancellationError {
             rec.status = .failed(message: "Zrušeno uživatelem")
             await publish(rec, persistImmediately: true, progress: progress)
-            print("[Pipeline] reprocess cancelled by user")
+            await clearProgress(for: rec.id)
+            Log.pipeline.info("reprocess cancelled by user")
         } catch {
             rec.status = .failed(message: error.localizedDescription)
             await publish(rec, persistImmediately: true, progress: progress)
+            await clearProgress(for: rec.id)
+        }
+    }
+
+    /// Drop the in-flight progress entry. Called on terminal status transitions so the banner
+    /// has nothing to overlay onto rec.status.
+    private func clearProgress(for id: UUID) async {
+        let store = recordings
+        await MainActor.run {
+            store.processingProgress[id] = nil
         }
     }
 
@@ -144,8 +157,7 @@ final class PipelineCoordinator {
         let originalDur = TimeInterval(samples.count) / AudioUtils.targetSampleRate
         let trimmedDur = TimeInterval(trimmedSamples.count) / AudioUtils.targetSampleRate
         let savedPct = originalDur > 0 ? Int((originalDur - trimmedDur) / originalDur * 100) : 0
-        print(String(format: "[Pipeline] speech-trim: %.1fs → %.1fs (saved %d%%)",
-                     originalDur, trimmedDur, savedPct))
+        Log.pipeline.info("speech-trim: \(originalDur, format: .fixed(precision: 1), privacy: .public)s → \(trimmedDur, format: .fixed(precision: 1), privacy: .public)s (saved \(savedPct, privacy: .public)%)")
 
         // Estimate parallel wall time. On M1 Pro, observed (after chunked-parallel diarize):
         //   - Whisper turbo + parallel workers ≈ 25× realtime on trimmed audio
@@ -158,7 +170,9 @@ final class PipelineCoordinator {
         let recId = rec.id
         let store = recordings
 
-        // Smooth progress driver: every 250ms updates rec.status with interpolated value.
+        // Smooth progress driver: every 250ms publishes interpolated progress into the store's
+        // lightweight `processingProgress` dict — NOT the full recordings array. Banner consumers
+        // overlay the tick onto rec.status; list views only re-render on real stage flips below.
         // Stage label flips from .transcribing → .diarizing at the halfway mark just to give
         // the user a sense of which phase is running (both run in parallel, but diarize tends
         // to be the long pole, so showing it for the second half is honest enough).
@@ -168,11 +182,7 @@ final class PipelineCoordinator {
                 let phaseFrac = Swift.min(0.99, elapsed / parallelEstimate)
                 let overall = 0.05 + 0.90 * phaseFrac
                 let stage: Recording.ProcessingStatus.Stage = phaseFrac < 0.5 ? .transcribing : .diarizing
-                if let idx = store.recordings.firstIndex(where: { $0.id == recId }) {
-                    var r = store.recordings[idx]
-                    r.status = .running(stage: stage, progress: overall)
-                    store.upsert(r)
-                }
+                store.processingProgress[recId] = ProcessingTick(stage: stage, progress: overall)
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
@@ -228,6 +238,7 @@ final class PipelineCoordinator {
 
         rec.status = .done
         await publish(rec, persistImmediately: true, progress: progress)  // terminal → flush
+        await clearProgress(for: rec.id)
     }
 
     /// Hop to MainActor to upsert the recording into the store and notify the caller. Used at
@@ -274,7 +285,7 @@ final class PipelineCoordinator {
                 } else if emb.count == sum.count {
                     for i in 0..<sum.count { sum[i] += emb[i] }
                 } else {
-                    print("[Pipeline] cluster \(cid): skipping turn — embedding dim mismatch (\(emb.count) vs \(sum.count))")
+                    Log.pipeline.notice("cluster \(cid, privacy: .public): skipping turn — embedding dim mismatch (\(emb.count, privacy: .public) vs \(sum.count, privacy: .public))")
                     continue
                 }
                 n += 1
@@ -351,7 +362,7 @@ final class PipelineCoordinator {
 
         let mergedCount = embeddings.count - mergedEmbeddings.count
         if mergedCount > 0 {
-            print("[Pipeline] auto-merged \(mergedCount) cluster(s) (similarity ≥ \(threshold))")
+            Log.pipeline.info("auto-merged \(mergedCount, privacy: .public) cluster(s) (similarity ≥ \(threshold, privacy: .public))")
         }
 
         return (mergedTurns, mergedEmbeddings)

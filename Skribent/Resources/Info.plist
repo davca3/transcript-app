@@ -26,5 +26,7 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Skribent potřebuje přístup k mikrofonu pro nahrávání přepisů.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Skribent zachytává systémový zvuk pro nahrávání schůzek a hovorů.</string>
 </dict>
 </plist>

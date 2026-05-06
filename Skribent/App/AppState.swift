@@ -65,6 +65,20 @@ final class AppState: ObservableObject {
         // including during pipeline stage updates (5×/recording). Views that need a store
         // declare it as their own @EnvironmentObject (see SkribentApp).
 
+        // Surface store-level persistence failures via globalError so the UI banner can show them
+        // instead of silently dropping the error to the log. Each store publishes `lastError`
+        // independently — we coalesce both into the single AppState-owned globalError channel.
+        recordings.$lastError
+            .compactMap { $0?.localizedDescription }
+            .receive(on: RunLoop.main)
+            .assign(to: \.globalError, on: self)
+            .store(in: &cancellables)
+        speakers.$lastError
+            .compactMap { $0?.localizedDescription }
+            .receive(on: RunLoop.main)
+            .assign(to: \.globalError, on: self)
+            .store(in: &cancellables)
+
         // Warm up models sequentially. Parallel cold-start peaks ~3–4 GB during simultaneous
         // ANE graph compilation (Whisper Turbo + pyannote + wespeaker) and gets jetsamed on
         // 16 GB Macs. Sequential adds ~5–10 s to TTFR but survives cold cache.
@@ -112,7 +126,7 @@ final class AppState: ObservableObject {
     /// shows a spinner during the unwind window.
     func cancelProcessing(for recording: Recording) {
         if let task = inflightTasks[recording.id] {
-            print("[AppState] cancelling in-flight task for \(recording.id)")
+            Log.app.info("cancelling in-flight task for \(recording.id, privacy: .public)")
             cancellingIds.insert(recording.id)
             task.cancel()
         }
@@ -227,7 +241,7 @@ final class AppState: ObservableObject {
                 // (we only persist on full success). Just revert the status — no error popup.
                 rec.status = .done
                 recordings.upsert(rec, persistImmediately: true)
-                print("[AppState] refine cancelled by user")
+                Log.app.info("refine cancelled by user")
             } catch {
                 rec.status = .failed(message: error.localizedDescription)
                 recordings.upsert(rec, persistImmediately: true)
@@ -249,7 +263,7 @@ final class AppState: ObservableObject {
         let displayName: String
         if let existing = speakers.speakers.first(where: { $0.name.caseInsensitiveCompare(normalized) == .orderedSame }) {
             // Name already exists → treat as merge: add this cluster's embedding to the existing speaker.
-            print("[AppState] promoteUnnamed: name \"\(normalized)\" already exists, merging into existing speaker")
+            Log.app.info("promoteUnnamed: name \"\(normalized, privacy: .public)\" already exists, merging into existing speaker")
             if !stored.embedding.isEmpty {
                 speakers.addSample(to: existing.id, embedding: stored.embedding)
             }
@@ -273,13 +287,11 @@ final class AppState: ObservableObject {
             }
         }
         recordings.saveArtifact(artifact, for: recording)
-        objectWillChange.send()
     }
 
     /// User renamed an already-known speaker.
     func renameKnown(speakerId: UUID, to newName: String) {
         speakers.rename(speakerId, to: newName)
-        objectWillChange.send()
     }
 
     /// Re-run identification on every currently-unnamed cluster in this recording.
@@ -309,7 +321,6 @@ final class AppState: ObservableObject {
             matched += 1
         }
         recordings.saveArtifact(artifact, for: recording)
-        objectWillChange.send()
         return matched
     }
 
@@ -335,7 +346,6 @@ final class AppState: ObservableObject {
             artifact.transcript.segments[i].speakerId = newUnnamedId
         }
         recordings.saveArtifact(artifact, for: recording)
-        objectWillChange.send()
     }
 
     /// User added a sample to an existing speaker from a recording's cluster.
@@ -352,7 +362,6 @@ final class AppState: ObservableObject {
             }
         }
         recordings.saveArtifact(artifact, for: recording)
-        objectWillChange.send()
     }
 
 }
