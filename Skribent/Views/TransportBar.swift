@@ -21,7 +21,7 @@ struct TransportBar: View {
             .buttonStyle(.plain)
             .keyboardShortcut(.space, modifiers: [])
 
-            Text(formatTime(dragValue ?? progress.currentTime))
+            Text(TimeInterval(dragValue ?? progress.currentTime).hms)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 48, alignment: .trailing)
@@ -40,7 +40,7 @@ struct TransportBar: View {
                 }
             )
 
-            Text(formatTime(player.duration))
+            Text(player.duration.hms)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 48, alignment: .leading)
@@ -55,9 +55,4 @@ struct TransportBar: View {
         .background(Color.gray.opacity(0.06))
     }
 
-    private func formatTime(_ t: TimeInterval) -> String {
-        guard t.isFinite, t >= 0 else { return "0:00" }
-        let h = Int(t) / 3600, m = (Int(t) % 3600) / 60, s = Int(t) % 60
-        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
-    }
 }

@@ -23,7 +23,7 @@ struct RecordingDetailHeader: View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(recording.title).font(.title2).bold()
-                Text("\(recording.createdAt, style: .date) • \(recording.createdAt, style: .time) • \(formatDuration(recording.duration))")
+                Text("\(recording.createdAt, style: .date) • \(recording.createdAt, style: .time) • \(recording.duration.humanDuration)")
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
@@ -72,8 +72,4 @@ struct RecordingDetailHeader: View {
         }
     }
 
-    private func formatDuration(_ t: TimeInterval) -> String {
-        let m = Int(t) / 60, s = Int(t) % 60
-        return String(format: "%d min %02d s", m, s)
-    }
 }

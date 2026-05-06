@@ -415,16 +415,16 @@ final class PipelineCoordinator {
     private func storedAssignments(
         from assignments: [Int: SpeakerAssignment],
         clusterEmbeddings: [(clusterId: Int, embedding: [Float])]
-    ) -> [String: StoredAssignment] {
+    ) -> [Int: StoredAssignment] {
         let embDict = Dictionary(uniqueKeysWithValues: clusterEmbeddings.map { ($0.clusterId, $0.embedding) })
-        var out: [String: StoredAssignment] = [:]
+        var out: [Int: StoredAssignment] = [:]
         for (cid, a) in assignments {
             let emb = embDict[cid] ?? []
             switch a {
             case .known(let id, let name, _):
-                out[String(cid)] = StoredAssignment(speakerId: id, displayName: name, embedding: emb)
+                out[cid] = StoredAssignment(speakerId: id, displayName: name, embedding: emb)
             case .unnamed(let idx, _):
-                out[String(cid)] = StoredAssignment(speakerId: nil, displayName: "Speaker \(idx)", embedding: emb)
+                out[cid] = StoredAssignment(speakerId: nil, displayName: "Speaker \(idx)", embedding: emb)
             }
         }
         return out

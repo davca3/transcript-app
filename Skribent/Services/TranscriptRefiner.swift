@@ -1,4 +1,5 @@
 import Foundation
+import os
 // `Hub`, `HuggingFace`, `Tokenizers` are required at the macro call site below — the
 // `#huggingFaceLoadModelContainer` macro expands to code that references types in those
 // modules (HubClient, AutoTokenizer), so without these imports the expansion fails.
@@ -42,22 +43,6 @@ final class TranscriptRefiner {
     /// repo is ~4.3 GB; if you swap models, update this estimate so the bar isn't off.
     private nonisolated static let estimatedTotalBytes: Int64 = 4_500_000_000
 
-    /// Tiny lock-protected Int64 — used so the progress-poll task can safely read the
-    /// HubClient-reported total while the resolve callback writes it. `os_unfair_lock` is the
-    /// fastest available primitive on Apple platforms for this kind of single-word access.
-    private final class AtomicInt64: @unchecked Sendable {
-        private var lock = os_unfair_lock()
-        private var _value: Int64
-        init(_ initial: Int64) { _value = initial }
-        var value: Int64 {
-            os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
-            return _value
-        }
-        func set(_ new: Int64) {
-            os_unfair_lock_lock(&lock); defer { os_unfair_lock_unlock(&lock) }
-            _value = new
-        }
-    }
 
     /// Number of segments per LLM call. Balances cross-sentence context vs. per-call latency
     /// and token budget. 15 ≈ 2–3 minutes of meeting speech.
@@ -209,12 +194,16 @@ final class TranscriptRefiner {
         progress(.downloadingModel(fraction: 0, completedBytes: 0, totalBytes: Self.estimatedTotalBytes))
 
         let cacheURL = Self.hubCacheDir(for: Self.modelRepoId)
-        let totalBox = AtomicInt64(0)
+        // Lock-protected Int64 shared between the resolve progressHandler (writes) and the
+        // poll task (reads). OSAllocatedUnfairLock is Sendable out of the box, so the closures
+        // can capture it without an @unchecked Sendable wrapper.
+        let totalBox = OSAllocatedUnfairLock<Int64>(initialState: 0)
 
         let pollTask = Task<Void, Never>.detached(priority: .utility) {
             while !Task.isCancelled {
                 let onDisk = Self.directorySize(at: cacheURL)
-                let total = await Swift.max(totalBox.value, Self.estimatedTotalBytes)
+                let reported = totalBox.withLock { $0 }
+                let total = Swift.max(reported, Self.estimatedTotalBytes)
                 let fraction = total > 0 ? Swift.min(1.0, Double(onDisk) / Double(total)) : 0
                 progress(.downloadingModel(
                     fraction: fraction,
@@ -236,16 +225,17 @@ final class TranscriptRefiner {
                 // estimate. We deliberately ignore `completedUnitCount` here because it's the
                 // jumpy per-file-done value we're trying to smooth out.
                 if hubProgress.totalUnitCount > Self.estimatedTotalBytes / 10 {
-                    totalBox.set(hubProgress.totalUnitCount)
+                    totalBox.withLock { $0 = hubProgress.totalUnitCount }
                 }
             }
             pollTask.cancel()
             // One last poll to lock the bar at 100 % before the load phase begins.
             let finalSize = Self.directorySize(at: cacheURL)
+            let reportedTotal = totalBox.withLock { $0 }
             progress(.downloadingModel(
                 fraction: 1,
                 completedBytes: finalSize,
-                totalBytes: Swift.max(finalSize, totalBox.value)
+                totalBytes: Swift.max(finalSize, reportedTotal)
             ))
             let dlElapsed = Date().timeIntervalSince(t0)
             Log.refiner.info("download phase done in \(dlElapsed, format: .fixed(precision: 1), privacy: .public)s (\(Double(finalSize) / 1_000_000_000, format: .fixed(precision: 1), privacy: .public) GB on disk), loading into memory…")

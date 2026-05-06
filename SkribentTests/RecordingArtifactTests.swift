@@ -4,8 +4,8 @@ import XCTest
 final class RecordingArtifactTests: XCTestCase {
 
     private func makeArtifact(_ assignments: [(Int, StoredAssignment)]) -> RecordingArtifact {
-        var dict: [String: StoredAssignment] = [:]
-        for (cid, a) in assignments { dict[String(cid)] = a }
+        var dict: [Int: StoredAssignment] = [:]
+        for (cid, a) in assignments { dict[cid] = a }
         return RecordingArtifact(transcript: Transcript(segments: [], detectedLanguage: nil),
                                  clusterAssignments: dict)
     }
@@ -41,6 +41,26 @@ final class RecordingArtifactTests: XCTestCase {
         XCTAssertEqual(names[5], "Speaker 1")
         XCTAssertEqual(names[7], "Speaker 2")
         XCTAssertEqual(names[8], "Speaker 3")
+    }
+
+    func test_decodeFromLegacyStringKeyedJSON_isCompatible() throws {
+        // Older app versions wrote clusterAssignments with String keys. Foundation's JSON
+        // encoder shapes [Int: V] the same way (string-shaped keys), so a hand-built
+        // legacy payload must still decode into the new [Int: StoredAssignment] type.
+        let legacyJSON = #"""
+        {
+          "transcript": { "segments": [], "detectedLanguage": null },
+          "clusterAssignments": {
+            "0": { "speakerId": null, "displayName": "Speaker 1", "embedding": [] },
+            "5": { "speakerId": null, "displayName": "Speaker 2", "embedding": [] }
+          }
+        }
+        """#
+        let data = Data(legacyJSON.utf8)
+        let artifact = try JSONDecoder().decode(RecordingArtifact.self, from: data)
+        XCTAssertEqual(artifact.clusterAssignments[0]?.displayName, "Speaker 1")
+        XCTAssertEqual(artifact.clusterAssignments[5]?.displayName, "Speaker 2")
+        XCTAssertEqual(artifact.clusterAssignments.count, 2)
     }
 
     func test_displayNames_mixedNamedAndUnnamed_keepsLiveNamesAndRenumbersUnnamedOnly() {

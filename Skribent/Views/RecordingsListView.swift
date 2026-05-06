@@ -48,7 +48,7 @@ private struct RecordingRow: View {
                     .font(.caption2).foregroundStyle(.tertiary)
                 Text(recording.createdAt, style: .date)
                 Text("•")
-                Text(formatDuration(recording.duration))
+                Text(recording.duration.compactDuration)
             }
             .font(.caption).foregroundStyle(.secondary)
         }
@@ -70,8 +70,4 @@ private struct RecordingRow: View {
         }
     }
 
-    private func formatDuration(_ t: TimeInterval) -> String {
-        let m = Int(t) / 60, s = Int(t) % 60
-        return String(format: "%d:%02d", m, s)
-    }
 }

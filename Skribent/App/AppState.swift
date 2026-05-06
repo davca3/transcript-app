@@ -210,8 +210,7 @@ final class AppState: ObservableObject {
             // the prompt so the LLM understands turn-taking and which corrections fit which
             // person's vocabulary.
             var nameMap: [UUID: String] = [:]
-            for (key, a) in artifact.clusterAssignments {
-                guard let cid = Int(key) else { continue }
+            for (cid, a) in artifact.clusterAssignments {
                 if let sid = a.speakerId {
                     let live = speakers.speakers.first(where: { $0.id == sid })?.name
                     nameMap[sid] = live ?? a.displayName
@@ -339,8 +338,8 @@ final class AppState: ObservableObject {
     func reidentifyUnnamed(in recording: Recording) -> Int {
         guard var artifact = recordings.loadArtifact(for: recording) else { return 0 }
         let unnamedClusters: [(clusterId: Int, embedding: [Float])] = artifact.clusterAssignments
-            .compactMap { (key, a) in
-                guard a.speakerId == nil, let cid = Int(key), !a.embedding.isEmpty else { return nil }
+            .compactMap { (cid, a) in
+                guard a.speakerId == nil, !a.embedding.isEmpty else { return nil }
                 return (cid, a.embedding)
             }
             .sorted { $0.clusterId < $1.clusterId }

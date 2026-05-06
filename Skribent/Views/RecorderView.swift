@@ -9,7 +9,7 @@ struct RecorderView: View {
 
     var body: some View {
         VStack(spacing: 18) {
-            Text(formatTime(recorder.elapsed))
+            Text(recorder.elapsed.hmsPadded)
                 .font(.system(size: 40, weight: .light, design: .monospaced))
 
             LevelMeter(level: recorder.level)
@@ -49,10 +49,6 @@ struct RecorderView: View {
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.08)))
     }
 
-    private func formatTime(_ t: TimeInterval) -> String {
-        let h = Int(t) / 3600, m = (Int(t) % 3600) / 60, s = Int(t) % 60
-        return String(format: "%02d:%02d:%02d", h, m, s)
-    }
 }
 
 private struct LevelMeter: View {

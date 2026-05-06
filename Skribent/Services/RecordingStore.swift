@@ -2,22 +2,22 @@ import Foundation
 import Combine
 
 /// Stored per-recording sidecar — transcript + per-cluster embeddings + speaker assignments.
-/// Cluster IDs are kept as strings so the JSON payload is human-readable.
+/// Cluster IDs are typed as `Int`; JSON serializes them as string-shaped keys (Foundation's
+/// default for `[Int: V]`) so older artifacts that wrote `[String: StoredAssignment]` still
+/// decode unchanged — same on-disk shape, stronger in-memory typing.
 struct RecordingArtifact: Codable, Hashable {
     var transcript: Transcript
-    var clusterAssignments: [String: StoredAssignment]
+    var clusterAssignments: [Int: StoredAssignment]
 
-    func assignment(for clusterId: Int) -> StoredAssignment? { clusterAssignments[String(clusterId)] }
-    mutating func setAssignment(_ a: StoredAssignment, for clusterId: Int) { clusterAssignments[String(clusterId)] = a }
+    func assignment(for clusterId: Int) -> StoredAssignment? { clusterAssignments[clusterId] }
+    mutating func setAssignment(_ a: StoredAssignment, for clusterId: Int) { clusterAssignments[clusterId] = a }
 
     /// Display-time mapping of clusterId → user-facing name. Two normalizations:
     /// - Named clusters use the live speaker name from the DB (so renames take effect immediately).
     /// - Unnamed clusters are renumbered sequentially (Speaker 1, 2, 3, ...) avoiding gaps left
     ///   by past unassigns/reidentifies (e.g. Speaker 5, 7, 8).
     func displayNames(knownSpeakers: [Speaker]) -> [Int: String] {
-        let pairs = clusterAssignments
-            .compactMap { (k, v) -> (Int, StoredAssignment)? in Int(k).map { ($0, v) } }
-            .sorted { $0.0 < $1.0 }
+        let pairs = clusterAssignments.sorted { $0.key < $1.key }
         var out: [Int: String] = [:]
         var unnamedCounter = 1
         for (cid, a) in pairs {
@@ -73,7 +73,10 @@ final class RecordingStore: ObservableObject {
     private var indexURL: URL { AppPaths.appSupport.appendingPathComponent("recordings.json") }
     private var saveDebounceTask: Task<Void, Never>?
 
-    init() { load() }
+    init() {
+        load()
+        cleanupOrphanedFolders()
+    }
 
     func load() {
         guard FileManager.default.fileExists(atPath: indexURL.path) else { return }
@@ -84,6 +87,37 @@ final class RecordingStore: ObservableObject {
         } catch {
             Log.store.error("RecordingStore load error: \(error.localizedDescription, privacy: .public)")
             lastError = error
+        }
+    }
+
+    /// Delete recording folders that aren't referenced by any entry in the index. Runs once at
+    /// startup to clean up after force-quits or partial-write crashes that leave audio.wav /
+    /// transcript.json under a UUID directory the index never recorded.
+    private func cleanupOrphanedFolders() {
+        let root = Self.recordingsRoot
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let knownIds = Set(recordings.map(\.id.uuidString))
+        var removed = 0
+        for entry in entries {
+            let isDir = (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            guard isDir, !knownIds.contains(entry.lastPathComponent) else { continue }
+            // Defensive: only delete folders whose name parses as a UUID — never touch anything
+            // a future feature might park under recordings/ for some other purpose.
+            guard UUID(uuidString: entry.lastPathComponent) != nil else { continue }
+            do {
+                try FileManager.default.removeItem(at: entry)
+                removed += 1
+            } catch {
+                Log.store.notice("orphan cleanup failed for \(entry.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        if removed > 0 {
+            Log.store.info("cleaned up \(removed, privacy: .public) orphaned recording folder(s)")
         }
     }
 

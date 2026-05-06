@@ -144,7 +144,7 @@ struct ProgressBanner: View {
                 }
                 HStack(spacing: 8) {
                     if let elapsed {
-                        Label(format(elapsed), systemImage: "clock")
+                        Label(elapsed.bannerLabel, systemImage: "clock")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
@@ -155,7 +155,7 @@ struct ProgressBanner: View {
                     }
                     Spacer()
                     if let eta {
-                        Text("Zbývá ~\(format(eta))")
+                        Text("Zbývá ~\(eta.bannerLabel)")
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(.tertiary)
                     }
@@ -199,12 +199,6 @@ struct ProgressBanner: View {
         return Swift.max(0, total - elapsed)
     }
 
-    private func format(_ t: TimeInterval) -> String {
-        guard t.isFinite, t >= 0 else { return "—" }
-        if t < 60 { return String(format: "%d s", Int(t.rounded())) }
-        let m = Int(t) / 60, s = Int(t) % 60
-        return String(format: "%d:%02d min", m, s)
-    }
 }
 
 private extension Recording.ProcessingStatus.Stage {

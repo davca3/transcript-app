@@ -3,6 +3,7 @@ import Accelerate
 import CoreAudio
 import Combine
 import Foundation
+import os
 
 @MainActor
 final class AudioRecorder: ObservableObject {
@@ -211,19 +212,20 @@ final class AudioRecorder: ObservableObject {
 }
 
 /// Thread-safe throttle gate. Callable from any thread (including audio render thread).
-final class LevelPublishThrottle: @unchecked Sendable {
+/// Backed by `OSAllocatedUnfairLock` so the type is `Sendable` without an `@unchecked` escape.
+final class LevelPublishThrottle: Sendable {
     private let intervalSec: TimeInterval
-    private var lastAt: TimeInterval = 0
-    private let lock = NSLock()
+    private let lastAt = OSAllocatedUnfairLock<TimeInterval>(initialState: 0)
 
     init(intervalSec: TimeInterval) { self.intervalSec = intervalSec }
 
     func shouldPublishNow() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        let now = CFAbsoluteTimeGetCurrent()
-        if now - lastAt < intervalSec { return false }
-        lastAt = now
-        return true
+        lastAt.withLock { last in
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - last < intervalSec { return false }
+            last = now
+            return true
+        }
     }
 }
 

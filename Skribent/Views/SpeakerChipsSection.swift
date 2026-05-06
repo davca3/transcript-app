@@ -16,11 +16,14 @@ struct SpeakerChipsSection: View {
     @State private var renamingClusterId: Int?
     @State private var renameDraft: String = ""
     @State private var reidentifyToast: String?
+    /// Memoized chips. Recomputed only when the artifact or the live speaker DB changes —
+    /// SwiftUI re-evaluates `body` on a parent player tick / autoFollow flip and we don't want
+    /// to re-walk segments + clusterAssignments on every one of those.
+    @State private var cachedChips: [DisplayChip] = []
 
     var body: some View {
-        let chips = displayChips(for: artifact)
         FlowLayout(spacing: 8, lineSpacing: 8) {
-            ForEach(chips, id: \.displayName) { chip in
+            ForEach(cachedChips, id: \.displayName) { chip in
                 SpeakerChip(
                     assignment: chip.representative,
                     knownSpeakers: speakers.speakers,
@@ -77,6 +80,9 @@ struct SpeakerChipsSection: View {
         } message: {
             Text(reidentifyToast ?? "")
         }
+        .task(id: ChipCacheKey(artifact: artifact, speakers: speakers.speakers)) {
+            cachedChips = displayChips(for: artifact)
+        }
     }
 
     /// Collapse clusters with the same display name into a single chip and renumber unnamed
@@ -84,8 +90,7 @@ struct SpeakerChipsSection: View {
     /// (artifacts produced by older pipeline runs before that filter was added).
     private func displayChips(for artifact: RecordingArtifact) -> [DisplayChip] {
         var clustersForSpeakerId: [UUID: [Int]] = [:]
-        for (key, a) in artifact.clusterAssignments {
-            guard let cid = Int(key) else { continue }
+        for (cid, a) in artifact.clusterAssignments {
             let sid = a.speakerId ?? UnnamedSpeakerID.make(clusterId: cid)
             clustersForSpeakerId[sid, default: []].append(cid)
         }
@@ -96,11 +101,8 @@ struct SpeakerChipsSection: View {
         }
 
         let pairs = artifact.clusterAssignments
-            .compactMap { (k, v) -> (Int, StoredAssignment)? in
-                guard let cid = Int(k), referenced.contains(cid) else { return nil }
-                return (cid, v)
-            }
-            .sorted { $0.0 < $1.0 }
+            .filter { referenced.contains($0.key) }
+            .sorted { $0.key < $1.key }
 
         var entries: [DisplayChip] = []
         var indexByName: [String: Int] = [:]
@@ -168,4 +170,12 @@ struct DisplayChip {
     var displayName: String
     var representative: StoredAssignment
     var clusterIds: [Int]
+}
+
+/// Cache invalidation key for `cachedChips`. Combines artifact identity + the live speakers DB
+/// so renames in the DB invalidate the cache (a known cluster's display name pulls from the DB
+/// at chip-build time). Avoids wiring two separate `.onChange` observers.
+private struct ChipCacheKey: Hashable {
+    let artifact: RecordingArtifact
+    let speakers: [Speaker]
 }

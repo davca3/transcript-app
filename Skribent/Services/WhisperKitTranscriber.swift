@@ -1,5 +1,6 @@
 import CoreML
 import Foundation
+import os
 import WhisperKit
 
 @MainActor
@@ -202,20 +203,21 @@ enum TranscriptionError: LocalizedError {
     }
 }
 
-/// Throttles progress logging — print every full percent + total/completed units once per second max.
-private final class LoggedProgress: @unchecked Sendable {
-    private var lastFrac: Double = -1
-    private var lastTime = Date.distantPast
-    private let lock = NSLock()
+/// Throttles progress logging — emit every full percent or once per second, whichever fires
+/// first. Backed by `OSAllocatedUnfairLock` so the type is `Sendable` without `@unchecked`.
+private final class LoggedProgress: Sendable {
+    private struct State { var lastFrac: Double; var lastTime: Date }
+    private let state = OSAllocatedUnfairLock<State>(initialState: State(lastFrac: -1, lastTime: .distantPast))
 
     func shouldLog(frac: Double) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        let now = Date()
-        let bigJump = abs(frac - lastFrac) >= 0.01
-        let timePassed = now.timeIntervalSince(lastTime) >= 1.0
-        guard bigJump || timePassed else { return false }
-        lastFrac = frac
-        lastTime = now
-        return true
+        state.withLock { s in
+            let now = Date()
+            let bigJump = abs(frac - s.lastFrac) >= 0.01
+            let timePassed = now.timeIntervalSince(s.lastTime) >= 1.0
+            guard bigJump || timePassed else { return false }
+            s.lastFrac = frac
+            s.lastTime = now
+            return true
+        }
     }
 }

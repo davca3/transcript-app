@@ -66,8 +66,8 @@ struct TranscriptView: View {
         // Build clusterId → name once, then cluster→speakerId reverse map for lookup per segment.
         let names = artifact.displayNames(knownSpeakers: speakerStore.speakers)
         var nameForSpeakerId: [UUID: String] = [:]
-        for (key, a) in artifact.clusterAssignments {
-            guard let cid = Int(key), let n = names[cid] else { continue }
+        for (cid, a) in artifact.clusterAssignments {
+            guard let n = names[cid] else { continue }
             if let sid = a.speakerId {
                 nameForSpeakerId[sid] = n
             } else {
@@ -76,15 +76,25 @@ struct TranscriptView: View {
             }
         }
 
+        // Memoize speaker → palette color across this recompute. djb2-on-UUID is cheap but for
+        // a 1000-segment transcript with 4 speakers we'd hash 4 × 1000 = 4000× on the inner loop;
+        // caching makes that 4 lookups + 1000 dict reads.
+        var colorCache: [UUID?: Color] = [:]
         var out: [SegmentGroup] = []
         for seg in artifact.transcript.segments {
             let name = seg.speakerId.flatMap { nameForSpeakerId[$0] } ?? "Neznámý"
-            let color = color(for: seg.speakerId)
+            let segColor: Color
+            if let cached = colorCache[seg.speakerId] {
+                segColor = cached
+            } else {
+                segColor = color(for: seg.speakerId)
+                colorCache[seg.speakerId] = segColor
+            }
             if var last = out.last, last.speakerName == name {
                 last.segments.append(seg)
                 out[out.count - 1] = last
             } else {
-                out.append(SegmentGroup(speakerName: name, color: color, segments: [seg]))
+                out.append(SegmentGroup(speakerName: name, color: segColor, segments: [seg]))
             }
         }
         groups = out
@@ -134,12 +144,12 @@ private struct TranscriptGroupRow: View {
                 Button {
                     onPlay()
                 } label: {
-                    Label(formatTime(group.start), systemImage: "play.circle.fill")
+                    Label(group.start.hms, systemImage: "play.circle.fill")
                         .labelStyle(.titleAndIcon)
                         .font(.caption.monospacedDigit())
                 }
                 .buttonStyle(.borderless)
-                .help("Přehrát tuto pasáž (\(formatTime(group.start))–\(formatTime(group.end)))")
+                .help("Přehrát tuto pasáž (\(group.start.hms)–\(group.end.hms))")
 
                 Button {
                     copyToClipboard(group.text)
@@ -166,7 +176,7 @@ private struct TranscriptGroupRow: View {
                             if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
                         }
                         .onTapGesture { onSeek(seg.start) }
-                        .help("Klikni pro skok na \(formatTime(seg.start))")
+                        .help("Klikni pro skok na \(seg.start.hms)")
                 }
             }
         }
@@ -190,11 +200,6 @@ private struct TranscriptGroupRow: View {
         pb.setString(s, forType: .string)
     }
 
-    private func formatTime(_ t: TimeInterval) -> String {
-        guard t.isFinite, t >= 0 else { return "0:00" }
-        let h = Int(t) / 3600, m = (Int(t) % 3600) / 60, s = Int(t) % 60
-        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
-    }
 }
 
 private struct SegmentGroup: Identifiable, Equatable {
