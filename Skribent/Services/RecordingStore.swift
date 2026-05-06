@@ -178,7 +178,16 @@ final class RecordingStore: ObservableObject {
     }
 
     func delete(_ id: UUID) {
-        if let r = recordings.first(where: { $0.id == id }) {
+        delete(ids: [id])
+    }
+
+    /// Bulk delete: removes folders + index entries + cache entries for all ids, then writes the
+    /// index once. Skips ids that aren't in `recordings` (e.g. already-deleted by a parallel
+    /// path). Folder removal failures are logged + surfaced via `lastError` but don't abort the
+    /// rest of the batch — the index is still rewritten so we don't leave a half-applied state.
+    func delete(ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        for r in recordings where ids.contains(r.id) {
             do {
                 try FileManager.default.removeItem(at: r.folderURL)
             } catch CocoaError.fileNoSuchFile {
@@ -188,9 +197,11 @@ final class RecordingStore: ObservableObject {
                 lastError = error
             }
         }
-        recordings.removeAll { $0.id == id }
-        artifactsByRecording[id] = nil
-        processingProgress[id] = nil
+        recordings.removeAll { ids.contains($0.id) }
+        for id in ids {
+            artifactsByRecording[id] = nil
+            processingProgress[id] = nil
+        }
         save()
     }
 

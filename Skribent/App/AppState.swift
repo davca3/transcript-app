@@ -185,6 +185,32 @@ final class AppState: ObservableObject {
         recordings.delete(id)
     }
 
+    /// Bulk delete with a single index save at the end. Cancels each id's in-flight task before
+    /// touching the filesystem. Cheaper than calling `deleteRecording` in a loop on a 50-item
+    /// selection — one save() vs. N saves. No-op on empty input.
+    func deleteRecordings(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        Log.app.info("bulk delete \(ids.count, privacy: .public) recording(s)")
+        for id in ids where inflightTasks[id] != nil {
+            inflightTasks[id]?.cancel()
+            inflightTasks[id] = nil
+            cancellingIds.remove(id)
+        }
+        recordings.delete(ids: ids)
+    }
+
+    /// Rename a recording's display title. Whitespace-trimmed; no-op on empty result. Persists
+    /// immediately (recording metadata is hot path for the sidebar list).
+    func renameRecording(_ id: UUID, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty,
+              let idx = recordings.recordings.firstIndex(where: { $0.id == id }) else { return }
+        var rec = recordings.recordings[idx]
+        guard rec.title != trimmed else { return }
+        rec.title = trimmed
+        recordings.upsert(rec, persistImmediately: true)
+    }
+
     /// Format Foundation's `Progress` byte counts into a Czech "completed z total" string for
     /// the progress banner. Falls back to file-count format if the Hub API uses unit counts
     /// instead of bytes (it usually doesn't, but `LLMEvaluator` upstream guards for it).
